@@ -1,0 +1,16 @@
+[Unit]
+Description=rocBudAI Ollama nftables ACL
+Documentation=file:///shared/apps/ubuntu/opt/rocbudai/README.md
+After=network-pre.target nftables.service
+Wants=nftables.service
+Before=ollama.service ollama-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Pre-flush in case the table already exists (idempotent).
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/ollama-acl.nft
+ExecStop=-/usr/sbin/nft destroy table inet ollama_acl
+
+[Install]
+WantedBy=multi-user.target

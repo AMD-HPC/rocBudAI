@@ -1,0 +1,65 @@
+[Unit]
+Description=rocBudAI — sync NFS Ollama_Models to local NVMe (kills 9-min cold-start)
+Documentation=man:rocbudai(1)
+
+# Why this exists: NFS read of a 120B-class weights blob (~65 GB; the
+# figure below was measured on gpt-oss:120b, the then-default — the
+# current default is qwen3.5:122b and the mechanism is model-agnostic)
+# is ~112 MB/s on the reference cluster, which means the very first
+# inference call after `ollama.service` starts pays ~9-10 minutes of
+# I/O wall-clock before it can produce a token. Local NVMe is ~22x
+# faster (~2.5 GB/s), so caching the model store on /var/local/cache/
+# brings that to ~26 s. The cluster prolog also runs
+#     echo 3 | sudo tee /proc/sys/vm/drop_caches
+# at every job start, which clobbers the kernel page cache — so a
+# pure RAM-side pre-warm is wiped before ollama can use it. A copy
+# on local block storage survives drop_caches and is the right shape.
+#
+# Dependencies:
+#   shareddata.mount       — needs NFS up before rsync source is reachable
+#   network-online.target  — belt-and-suspenders for warewulf:/shareddata
+#   ollama.service         — must NOT start until our rsync is complete,
+#                            else ollama would mmap an empty cache dir
+After=shareddata.mount network-online.target
+Wants=shareddata.mount network-online.target
+Before=ollama.service
+
+# If NFS is unreachable, skip the rsync entirely and let ollama fall
+# back to whatever it has (or fail gracefully). Boot continuation >
+# fail-closed: a node that can't sync is still useful for non-rocbudai
+# workloads.
+ConditionPathIsDirectory=/shareddata/Ollama_Models
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/mkdir -p /var/local/cache/ollama
+
+# `--delete` mirrors NFS state — if a model is removed upstream, the
+# local copy is also removed. This is run BEFORE ollama starts (no
+# concurrent reader), so a partial-state delete can't surprise a live
+# inference. After boot, the local cache is static until next boot or
+# manual `systemctl restart rocbudai-model-cache`.
+#
+# `--exclude=.tmp.*` skips ollama's pull-in-progress temp blobs (see
+# `ollama pull` internals).
+ExecStart=/usr/bin/rsync -a --delete --exclude='.tmp.*' \
+    /shareddata/Ollama_Models/ /var/local/cache/ollama/
+
+# Ownership matters: the ollama daemon runs as the `ollama` user and
+# must be able to read every blob it mmaps.
+ExecStartPost=/bin/chown -R ollama:ollama /var/local/cache/ollama
+
+# Sizing budget: at the reference cluster's ~108 MB/s NFS read rate,
+# 60 min covers ~388 GB of cold rsync — comfortably more than the
+# current 263 GB model store (gpt-oss:120b + qwen3.5:122b +
+# nemotron-3-super:120b, post-2026-06-02). Bumped from the original
+# 20 min on 2026-06-02 after the nemotron-3-super:120b (87 GB) pull
+# tripped the 20 min ceiling on a reference SPX node — the qwen3.5:122b
+# pull a few weeks earlier had finished in 14 min and hidden the
+# headroom problem. Audit: 2026-06-02-add-nemotron-3-super-120b.md
+# §1.6 + Follow-ups #1.
+TimeoutStartSec=60min
+
+[Install]
+WantedBy=multi-user.target

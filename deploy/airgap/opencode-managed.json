@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "disabled_providers": [
+    "anthropic",
+    "openai",
+    "openrouter",
+    "google",
+    "gemini",
+    "amazon-bedrock",
+    "azure",
+    "groq",
+    "mistral",
+    "xai",
+    "deepseek",
+    "meta",
+    "github-copilot",
+    "vertex"
+  ]
+}

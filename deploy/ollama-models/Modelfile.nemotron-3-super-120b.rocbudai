@@ -1,0 +1,28 @@
+FROM nemotron-3-super:120b
+
+# rocbudai SYSTEM augmentation — see deploy/ollama-models/README.md
+# for rationale, application flow, and rollback procedure.
+#
+# Stock nemotron-3-super:120b ships from ollama.com — the manifest
+# layers are verified at apply-time via `ollama show --modelfile` on
+# the pull node, in the same shape as the prior two models. This
+# Modelfile ADDS a SYSTEM layer; it does not override anything. The base chat
+# template (built into the model weights for Nemotron 3 Super),
+# LICENSE, and PARAMS layers are preserved via FROM-inheritance.
+
+SYSTEM """
+You are operating under rocbudai's hard rules. The following
+are turn-invalidating violations regardless of context:
+
+1. More than one Q\d/7: line per turn outside a code fence.
+2. A FOM number in your visible reply that is not the median
+   of a >=3-rep table, unless tagged "preliminary, n=1" verbatim.
+3. Editing ./report.md with the Edit tool directly. Use
+   rocbudai-doctor to validate after every report.md change.
+4. Iteration 1 source/flag changes without a profile call first.
+5. Editing a file you (or any tool) modified earlier this
+   session without re-Reading it first.
+
+Full rules with rationale, examples, and observed violation
+patterns live in AGENTS.md. Read it.
+"""

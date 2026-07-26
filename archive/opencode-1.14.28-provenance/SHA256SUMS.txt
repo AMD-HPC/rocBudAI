@@ -1,0 +1,1 @@
+3f9a7139612d4421a46408d46eeed27bd958bdbe7f43514cd5e5a10ad1540e5b  opencode-linux-x64.tar.gz

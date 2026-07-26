@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-airgap-probe — telemetry hygiene watchdog.
+#
+# Invoked at the end of /etc/cron.daily/rocbudai-harvest (so it sees the
+# harvest output written seconds earlier). Can also be re-run manually:
+#   sudo /usr/local/sbin/rocbudai-airgap-probe
+#
+# Output goes into the SAME file the harvester writes to, as a row of
+# event type "hygiene_check". An AI tool parsing the usage log will see
+# the watchdog's verdict alongside the daily_usage rows in a single
+# stream, so admins do not have to remember to read syslog separately.
+#
+# Schema of the row this script appends:
+#
+#   on success:
+#     {"event":"hygiene_check","date":"YYYY-MM-DD","status":"ok"}
+#
+#   on failure:
+#     {"event":"hygiene_check","date":"YYYY-MM-DD","status":"fail",
+#      "reason":"<short tag>","detail":"<≤200 chars>"}
+#
+# Failure reasons:
+#   "perms"        — log file is not 0600 root:root
+#   "row_size"     — a row exceeds 1024 bytes (possible content leak)
+#   "schema"       — a row uses keys outside the per-event allow-list
+#                    (or has an unknown event type)
+#   "not_json"     — a row failed to parse as JSON
+#
+# Exit code 0 on pass, 1 on fail (so cron's run-parts mailer also notices
+# if it is configured — but the row in the log is the canonical signal).
+
+set -uo pipefail
+
+LOG="${ROCBUDAI_USAGE_LOG:-/var/log/rocbudai-usage.jsonl}"
+DATE_TODAY="$(date +%F)"
+
+emit() {
+    STATUS="$1" REASON="${2:-}" DETAIL="${3:-}" \
+    DATE_TODAY="$DATE_TODAY" LOG="$LOG" \
+    python3 - <<'PY'
+import json, os
+row = {
+    "event":  "hygiene_check",
+    "date":   os.environ["DATE_TODAY"],
+    "status": os.environ["STATUS"],
+}
+if os.environ["STATUS"] == "fail":
+    row["reason"] = os.environ.get("REASON", "")
+    detail = os.environ.get("DETAIL", "")
+    if len(detail) > 200:
+        detail = detail[:197] + "..."
+    row["detail"] = detail
+with open(os.environ["LOG"], "a") as f:
+    f.write(json.dumps(row) + "\n")
+PY
+}
+
+# If the log doesn't exist yet there's nothing to verify; treat as ok-but-quiet.
+if [[ ! -e "$LOG" ]]; then
+    exit 0
+fi
+
+perm="$(stat -c '%a %U:%G' "$LOG" 2>/dev/null || echo '?')"
+if [[ "$perm" != "600 root:root" ]]; then
+    emit fail perms "log file is '${perm}', expected '600 root:root'"
+    exit 1
+fi
+
+if ! [[ -r "$LOG" ]]; then
+    emit fail perms "log file not readable by probe (running as $(id -un))"
+    exit 1
+fi
+
+oversize_line="$(awk 'length > 1024 {print NR; exit}' "$LOG")"
+if [[ -n "$oversize_line" ]]; then
+    emit fail row_size "line ${oversize_line} exceeds 1024 bytes (possible content leak)"
+    exit 1
+fi
+
+bad="$(LOG="$LOG" python3 - <<'PY'
+import json, os, sys
+
+# Per-event-type allow-list. Adding a new field anywhere in the
+# pipeline requires updating this map, which is the explicit gate
+# that stops accidental content capture.
+SCHEMA = {
+    "daily_usage": {
+        "event", "date", "user", "account",
+        "n_allocations", "total_minutes", "clean_exit_rate",
+        "n_sessions_named", "n_sessions_with_report",
+        "report_bytes_total", "returned_via_continue",
+    },
+    "hygiene_check": {
+        "event", "date", "status", "reason", "detail",
+    },
+}
+
+for n, line in enumerate(open(os.environ["LOG"]), 1):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        print(f"not_json|line {n}: not valid JSON")
+        sys.exit(0)
+    ev = d.get("event")
+    if ev not in SCHEMA:
+        print(f"schema|line {n}: unknown event '{ev}'")
+        sys.exit(0)
+    extra = set(d.keys()) - SCHEMA[ev]
+    if extra:
+        print(f"schema|line {n}: event '{ev}' has unexpected keys {sorted(extra)}")
+        sys.exit(0)
+PY
+)"
+if [[ -n "$bad" ]]; then
+    reason="${bad%%|*}"
+    detail="${bad#*|}"
+    emit fail "$reason" "$detail"
+    exit 1
+fi
+
+emit ok
+exit 0

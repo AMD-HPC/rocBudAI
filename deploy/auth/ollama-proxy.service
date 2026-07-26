@@ -1,0 +1,29 @@
+[Unit]
+Description=Ollama proxy (rocBudAI mutation-endpoint filter)
+Documentation=file:///shared/apps/ubuntu/opt/rocbudai/README.md
+After=network-online.target ollama.service
+Wants=network-online.target
+BindsTo=ollama.service
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+ExecStart=/usr/local/bin/ollama-proxy
+Restart=on-failure
+RestartSec=2
+
+# Hardening — proxy doesn't need write access to anything.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

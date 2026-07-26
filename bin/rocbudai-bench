@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-bench — measure wall-time of a command on a DEDICATED GPU,
+# with a per-GPU quiescence guard.
+#
+# Wraps the user's FOM (figure-of-merit) command in:
+#   1. A pre-flight quiescence wait scoped to the BENCH GPU only (poll
+#      rocm-smi until that GPU stays <=THRESHOLD% for QUIET_DURATION
+#      consecutive samples; or TIMEOUT seconds elapse — then WARN + proceed).
+#   2. N invocations (default 4) using /usr/bin/time -f '%e' for wall, each
+#      PINNED to the bench GPU (its device + its NUMA-local CPU cores).
+#   3. Drop the first rep as warmup, report median / min / max of the rest.
+#   4. Echo the FOM command's OWN output (the program-printed metric:
+#      LU/s, samples/s, GFLOP/s, …) from the last measured rep, under an
+#      explicit header/footer. This lets callers read their metric from
+#      this fast, pinned bench instead of a slow, unpinned direct run.
+#      (In --json mode the metric goes to stderr so stdout stays clean JSON.)
+#
+# WHY THIS EXISTS
+#   On a node where ollama is serving an in-RAM 120B model (the rocBudAI
+#   default), the model occupies a large share of GPU VRAM and spikes
+#   100% compute when generating tokens. A user FOM run that shares a GPU
+#   with the model+agent can be 10x-300x slower — pure contention for that
+#   GPU's compute units and memory, not a property of the user's code.
+#   Stress-test 2026-05-13 measured 250x slowdown on a 1.6 s baseline
+#   when ollama was actively answering a chat turn.
+#
+# DEDICATED-GPU ISOLATION (2026-06-05)
+#   The deployment reserves one GPU exclusively for the bench: ollama +
+#   the agent are fenced onto the other GPUs (ROCR_VISIBLE_DEVICES +
+#   cpuset), leaving the bench GPU quiet. This wrapper therefore:
+#     * selects ONLY the bench GPU for the timed command
+#       (ROCR_VISIBLE_DEVICES=$ROCBUDAI_BENCH_GPU), and
+#     * binds the timed command to that GPU's NUMA-local CPU cores
+#       (taskset -c $ROCBUDAI_BENCH_CPUS) so first-touch allocations land
+#       on the memory closest to the device (matters most on unified-memory
+#       APUs such as gfx942; harmless on discrete GPUs).
+#   The CPU list is one NUMA region, so there is no numactl --membind here.
+#   HSA_XNACK is NOT forced — if your code needs managed-memory page
+#   migration, `export HSA_XNACK=1` in your own shell and it is inherited.
+#   The quiescence guard is scoped to the bench GPU only, because the other
+#   GPUs are intentionally busy serving the model and must be ignored.
+#   This wrapper still ensures every FOM rep starts from a quiet GPU and
+#   that you never report a single-rep wall time as a [FACT].
+#
+# ENVIRONMENT
+#   ROCBUDAI_BENCH_GPU    GPU index the bench owns. Must be the GPU EXCLUDED
+#                         from the ollama/agent cpuset. Defaults to the
+#                         topology-derived bench GPU (the last GPU), else 0.
+#   ROCBUDAI_BENCH_CPUS   CPU core list for that GPU's NUMA node, taskset -c
+#                         syntax. Defaults to the topology-derived list (may
+#                         be empty, in which case taskset is skipped).
+#
+# USAGE
+#   rocbudai-bench [OPTIONS] -- <command> [args...]
+#
+# OPTIONS
+#   -n, --reps N             Number of reps including warmup (default: 4).
+#                            We always drop the first rep when N>1; min
+#                            effective N=3 for a 3-rep median (so
+#                            default REPS=4). N=1 is allowed (single-rep
+#                            mode) but the output is tagged [NOT-FOM] and
+#                            must NOT be cited as [FACT] per
+#                            AGENTS.md Rule 17.
+#   -t, --timeout SEC        Max seconds to wait for GPU to quiesce
+#                            (default: 30). On timeout: WARN and proceed.
+#   -T, --threshold PCT      Per-GPU utilisation considered "busy"
+#                            (default: 5). Sampled from rocm-smi -u.
+#   -d, --quiet-duration N   How many consecutive 1 Hz quiet samples are
+#                            needed to declare quiescent (default: 3).
+#   --no-wait                Skip the quiescence wait (use only when you
+#                            *know* the GPU is yours, e.g. on a node
+#                            without ollama).
+#   --json                   Emit a JSON one-liner instead of the human
+#                            report (for scripts / report.md embedding).
+#   -h, --help               This help.
+#
+# EXIT CODES
+#   0  command exited 0 on every rep, results emitted.
+#   1  command failed on at least one rep (results suppressed, last-20
+#      lines from the failing rep emitted to stderr).
+#   2  bad usage / no command after `--`.
+#   3  rocm-smi not found (and --no-wait not given).
+#
+# EXAMPLES
+#   # Default: 4 reps, drop warmup, 3-rep median.
+#   rocbudai-bench -- ./my_app
+#
+#   # 6 reps for a noisy benchmark.
+#   rocbudai-bench -n 6 -- mpirun -np 4 ./solver
+#
+#   # Single-rep [NOT-FOM] sanity check.
+#   rocbudai-bench -n 1 -- ./quick_smoke
+#
+#   # Skip quiescence on a GPU you fully own.
+#   rocbudai-bench --no-wait -- ./isolated_run
+#
+#   # Embed a result in report.md as JSON.
+#   rocbudai-bench --json -- ./fom > .bench.json
+#
+# OUTPUT (default human format)
+#   rocbudai-bench: GPU 3 quiet (GPU-util 0%, threshold 5%)
+#   rocbudai-bench: rep 1/4: 1.62 s   [warmup, dropped]
+#   rocbudai-bench: rep 2/4: 1.58 s
+#   rocbudai-bench: rep 3/4: 1.60 s
+#   rocbudai-bench: rep 4/4: 1.59 s
+#   rocbudai-bench: median = 1.59 s   (n=3 effective; min=1.58 max=1.60 [FACT])
+#   rocbudai-bench: ---- FOM command output (rep 4) ----
+#   Measured lattice updates: 30.1 GLU/s
+#   rocbudai-bench: ---- end FOM command output ----
+
+set -uo pipefail
+
+REPS=4
+TIMEOUT=30
+THRESHOLD=5
+QUIET_DURATION=3
+NO_WAIT=0
+JSON_OUT=0
+
+# Dedicated-GPU pinning (see DEDICATED-GPU ISOLATION above). Explicit
+# ROCBUDAI_BENCH_GPU / ROCBUDAI_BENCH_CPUS win; otherwise we derive them
+# from rocbudai-detect-topology.sh (last GPU = bench, its NUMA cores).
+# BENCH_CPUS may be empty (topology not derivable / container mode): then
+# the bench pins the GPU only and skips taskset.
+_user_bench_gpu="${ROCBUDAI_BENCH_GPU:-}"
+_user_bench_cpus="${ROCBUDAI_BENCH_CPUS:-}"
+_topo_helper=""
+if [[ -n "${ROCBUDAI_ROOT:-}" && -r "${ROCBUDAI_ROOT}/libexec/rocbudai-detect-topology.sh" ]]; then
+    _topo_helper="${ROCBUDAI_ROOT}/libexec/rocbudai-detect-topology.sh"
+else
+    _self_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd 2>/dev/null || true)"
+    [[ -n "$_self_dir" && -r "$_self_dir/libexec/rocbudai-detect-topology.sh" ]] && _topo_helper="$_self_dir/libexec/rocbudai-detect-topology.sh"
+fi
+if [[ -n "$_topo_helper" ]]; then
+    eval "$(bash "$_topo_helper" 2>/dev/null || true)"
+fi
+BENCH_GPU="${_user_bench_gpu:-${ROCBUDAI_BENCH_GPU:-0}}"
+BENCH_CPUS="${_user_bench_cpus:-${ROCBUDAI_BENCH_CPUS:-}}"
+
+err()  { echo "rocbudai-bench: error: $*" >&2; }
+info() { echo "rocbudai-bench: $*"; }
+warn() { echo "rocbudai-bench: WARN: $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+rocbudai-bench — wall-time benchmark with GPU-quiescence guard.
+
+USAGE:
+    rocbudai-bench [OPTIONS] -- <command> [args...]
+
+OPTIONS:
+    -n, --reps N            Reps including warmup (default 4; drop rep 1 when N>1).
+    -t, --timeout SEC       Max wait for GPU quiescence (default 30).
+    -T, --threshold PCT     Bench-GPU "busy" threshold (default 5).
+    -d, --quiet-duration N  Consecutive quiet samples required (default 3).
+    --no-wait               Skip the quiescence wait.
+    --json                  Emit JSON instead of human-readable summary.
+    -h, --help              This help.
+
+The bench runs PINNED to a dedicated GPU: its device is selected via
+ROCR_VISIBLE_DEVICES and it is bound to that GPU's NUMA-local CPU cores
+via taskset. Override with ROCBUDAI_BENCH_GPU / ROCBUDAI_BENCH_CPUS.
+
+See `head -110 $(command -v rocbudai-bench)` for full rationale,
+or AGENTS.md Rule 17 for why single-rep wall times are NOT FOM.
+EOF
+}
+
+# Locate rocm-smi: PATH first, then the highest real /opt/rocm-<ver> that
+# actually ships rocm-smi. We scan in descending version order and skip
+# *-patches-* trees: they sort ABOVE the real version dirs under `sort -V`
+# but contain no bin/rocm-smi, so a naive `tail -1` picks a dir with no
+# rocm-smi and the guard wrongly reports "not found".
+locate_rocm_smi() {
+    local p
+    if command -v rocm-smi >/dev/null 2>&1; then
+        command -v rocm-smi
+        return 0
+    fi
+    while IFS= read -r p; do
+        [[ "$p" == *-patches-* ]] && continue
+        if [[ -x "$p/bin/rocm-smi" ]]; then
+            echo "$p/bin/rocm-smi"
+            return 0
+        fi
+    done < <(ls -d /opt/rocm-* 2>/dev/null | sort -Vr)
+    return 1
+}
+
+# Sample rocm-smi once. Echoes the GPU-use % of the bench GPU ONLY
+# (GPU[$2]). The GPUs serving the model are intentionally busy and
+# MUST be ignored, else the guard would never observe quiescence.
+# Returns 0 on success, non-zero if rocm-smi failed. Echoes 0 if the
+# bench GPU's line is absent.
+sample_bench_pct() {
+    local rocm_smi="$1"
+    local gpu="$2"
+    local out
+    out=$("$rocm_smi" -u 2>/dev/null) || return 1
+    # Parse lines like:    "GPU[3]		: GPU use (%): 12"
+    echo "$out" | awk -v g="$gpu" '
+        $0 ~ ("GPU\\[" g "\\]") && /GPU use/ { print $NF + 0; found = 1 }
+        END { if (!found) print 0 }'
+}
+
+# Wait for GPU to be quiet. Echoes the LAST observed max-pct to stdout
+# regardless of outcome. Returns 0 on quiescence, non-zero on timeout.
+wait_for_quiet() {
+    local rocm_smi="$1"
+    local timeout_s="$2"
+    local threshold="$3"
+    local quiet_n="$4"
+    local quiet_streak=0
+    local elapsed=0
+    local max_pct=0
+    while [[ "$elapsed" -lt "$timeout_s" ]]; do
+        max_pct=$(sample_bench_pct "$rocm_smi" "$BENCH_GPU") || max_pct=0
+        if [[ "$max_pct" -le "$threshold" ]]; then
+            quiet_streak=$((quiet_streak + 1))
+            if [[ "$quiet_streak" -ge "$quiet_n" ]]; then
+                echo "$max_pct"
+                return 0
+            fi
+        else
+            quiet_streak=0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    echo "$max_pct"
+    return 1
+}
+
+# Run user's command once. Echoes wall time (seconds, e.g. "1.62") on
+# success; non-zero exit on command failure (with last-20 lines of
+# combined output sent to stderr).
+time_one_rep() {
+    local repnum="$1"
+    shift
+    local logfile
+    logfile=$(mktemp -t rocbudai-bench.rep.XXXXXX) || {
+        err "mktemp failed"
+        return 1
+    }
+    local rc=0
+    # Pin the timed command to the dedicated GPU: ROCR_VISIBLE_DEVICES
+    # selects that GPU; taskset binds to its NUMA-local CPU cores so
+    # first-touch allocations land on the closest memory (matters most on
+    # unified-memory APUs, harmless on discrete GPUs). No numactl (one NUMA
+    # region) and no forced HSA_XNACK (inherited from the caller's env if
+    # set). For MPI FOMs, intra-node rank binding stays the user's job
+    # (e.g. mpirun --bind-to core); this taskset just sets the cpuset.
+    local -a pin=(env "ROCR_VISIBLE_DEVICES=$BENCH_GPU")
+    [[ -n "$BENCH_CPUS" ]] && pin+=(taskset -c "$BENCH_CPUS")
+    "${pin[@]}" \
+        /usr/bin/time -f 'rocbudai-bench-wall: %e' -o "$logfile" --append -- \
+        "$@" >>"$logfile" 2>&1 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        err "rep ${repnum} failed (exit ${rc}) — last 20 lines:"
+        tail -20 "$logfile" >&2
+        rm -f "$logfile"
+        return $rc
+    fi
+    local t
+    t=$(awk '/^rocbudai-bench-wall:/ {print $2}' "$logfile" | tail -1)
+    # Retain this rep's program output (the FOM the program itself prints:
+    # LU/s, samples/s, GFLOP/s, …) so the caller can surface it after the
+    # timing summary — otherwise the mandated tool hides the number and
+    # agents fall back to slow, unpinned direct runs. Strip only our
+    # internal wall-time marker; do NOT parse the content (stay
+    # workload-agnostic). Skip the dropped warmup rep (rep 1 when REPS>1);
+    # the last measured rep overwrites, so FOM_LOG ends up holding the same
+    # rep whose wall time feeds the median. FOM_LOG is set by the caller.
+    if [[ -n "${FOM_LOG:-}" ]] && { [[ "$REPS" -eq 1 ]] || [[ "$repnum" -gt 1 ]]; }; then
+        grep -v '^rocbudai-bench-wall:' "$logfile" >"$FOM_LOG" 2>/dev/null || :
+    fi
+    rm -f "$logfile"
+    if [[ -z "$t" ]]; then
+        err "rep ${repnum}: failed to parse wall time"
+        return 1
+    fi
+    echo "$t"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--reps)            REPS="${2:?}"; shift 2 ;;
+        -t|--timeout)         TIMEOUT="${2:?}"; shift 2 ;;
+        -T|--threshold)       THRESHOLD="${2:?}"; shift 2 ;;
+        -d|--quiet-duration)  QUIET_DURATION="${2:?}"; shift 2 ;;
+        --no-wait)            NO_WAIT=1; shift ;;
+        --json)               JSON_OUT=1; shift ;;
+        -h|--help)            usage; exit 0 ;;
+        --)                   shift; break ;;
+        -*)                   err "unknown option: $1"; usage >&2; exit 2 ;;
+        *)                    break ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    err "no command after '--'"
+    usage >&2
+    exit 2
+fi
+
+if ! [[ "$REPS" =~ ^[0-9]+$ ]] || [[ "$REPS" -lt 1 ]]; then
+    err "reps must be a positive integer (got '$REPS')"
+    exit 2
+fi
+
+if ! command -v /usr/bin/time >/dev/null 2>&1; then
+    err "/usr/bin/time not found (this is the GNU time binary, not the bash builtin)"
+    err "install with: sudo apt-get install -y time"
+    exit 3
+fi
+
+if [[ -n "$BENCH_CPUS" ]] && ! command -v taskset >/dev/null 2>&1; then
+    err "taskset not found (util-linux) — needed to pin the bench to CPUs ${BENCH_CPUS}"
+    err "install with: sudo apt-get install -y util-linux"
+    exit 3
+fi
+
+# Fail loud when the FOM will run WITHOUT a NUMA CPU pin. An empty
+# BENCH_CPUS means taskset is skipped (see time_one_rep), which on a
+# unified-memory APU lets first-touch land on a NUMA node remote to the
+# bench GPU — measured ~20x slower / bimodal for memory-bound FOMs. This
+# used to degrade silently. Suppressed in container / no-fencing mode,
+# where the LLM and bench intentionally share all GPUs and no pin exists.
+if [[ -z "$BENCH_CPUS" && -z "${ROCBUDAI_CONTAINER:-}" && "${ROCBUDAI_NO_FENCING:-0}" != "1" ]]; then
+    warn "bench GPU ${BENCH_GPU} will run UNPINNED (no NUMA CPU pin; topology=${ROCBUDAI_TOPO_METHOD:-unknown})."
+    warn "memory-bound FOMs can be ~20x slower / bimodal from cross-NUMA first-touch."
+    warn "set ROCBUDAI_BENCH_CPUS to the bench GPU's NUMA-local cores (taskset -c syntax) to fix."
+fi
+
+if [[ "$NO_WAIT" -eq 0 ]]; then
+    ROCM_SMI=$(locate_rocm_smi) || {
+        err "rocm-smi not found on PATH or in /opt/rocm-*"
+        err "use --no-wait to skip the GPU-quiescence guard,"
+        err "or 'module load rocm' to put rocm-smi on PATH."
+        exit 3
+    }
+    if max_pct=$(wait_for_quiet "$ROCM_SMI" "$TIMEOUT" "$THRESHOLD" "$QUIET_DURATION"); then
+        info "GPU ${BENCH_GPU} quiet (GPU-util ${max_pct}%, threshold ${THRESHOLD}%)"
+    else
+        warn "GPU ${BENCH_GPU} not quiet after ${TIMEOUT}s (GPU-util ${max_pct}%, threshold ${THRESHOLD}%)"
+        warn "proceeding anyway — wall times will be noisier than typical"
+    fi
+fi
+
+declare -a TIMES=()
+ANY_FAIL=0
+# Representative rep's program output is stashed here by time_one_rep and
+# surfaced after the summary (see below), so agents read their FOM metric
+# from this fast pinned bench instead of a slow unpinned direct run. If
+# mktemp fails we simply skip the echo (timing is unaffected).
+FOM_LOG=$(mktemp -t rocbudai-bench.fom.XXXXXX 2>/dev/null) || FOM_LOG=""
+[[ -n "$FOM_LOG" ]] && trap 'rm -f "$FOM_LOG"' EXIT
+for i in $(seq 1 "$REPS"); do
+    if t=$(time_one_rep "$i" "$@"); then
+        TIMES+=("$t")
+        if [[ "$i" -eq 1 && "$REPS" -gt 1 ]]; then
+            info "rep ${i}/${REPS}: ${t} s   [warmup, dropped]"
+        else
+            info "rep ${i}/${REPS}: ${t} s"
+        fi
+    else
+        ANY_FAIL=1
+    fi
+done
+
+if [[ "$ANY_FAIL" -eq 1 ]]; then
+    err "at least one rep failed; not emitting summary"
+    exit 1
+fi
+
+declare -a EFFECTIVE
+if [[ "$REPS" -gt 1 ]]; then
+    EFFECTIVE=("${TIMES[@]:1}")
+else
+    EFFECTIVE=("${TIMES[@]}")
+fi
+EFF_N=${#EFFECTIVE[@]}
+
+mapfile -t SORTED < <(printf '%s\n' "${EFFECTIVE[@]}" | sort -g)
+MIN="${SORTED[0]}"
+MAX="${SORTED[$((EFF_N-1))]}"
+if [[ $((EFF_N % 2)) -eq 0 ]]; then
+    LOW="${SORTED[$((EFF_N/2-1))]}"
+    HI="${SORTED[$((EFF_N/2))]}"
+    MED=$(awk -v a="$LOW" -v b="$HI" 'BEGIN {printf "%.2f", (a+b)/2}')
+else
+    MED="${SORTED[$((EFF_N/2))]}"
+fi
+
+if [[ "$REPS" -eq 1 ]]; then
+    TAG="[NOT-FOM, n=1 — see AGENTS.md Rule 17]"
+elif [[ "$EFF_N" -lt 3 ]]; then
+    TAG="[NOT-FOM, n=${EFF_N} effective < 3 — see AGENTS.md Rule 17]"
+else
+    TAG="[FACT]"
+fi
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    printf '{"reps":%d,"effective":%d,"median":%s,"min":%s,"max":%s,"tag":"%s"}\n' \
+        "$REPS" "$EFF_N" "$MED" "$MIN" "$MAX" "$TAG"
+else
+    info "median = ${MED} s   (n=${EFF_N} effective; min=${MIN} max=${MAX} ${TAG})"
+fi
+
+# Surface the FOM command's own output (the metric the program prints) from
+# the representative — last measured — rep, under an explicit header/footer
+# so it is unambiguous which lines are the program's. The internal
+# wall-time marker was already stripped in time_one_rep, and we do NOT parse
+# the content (workload-agnostic). Human mode: to stdout after the summary.
+# --json mode: to stderr, so stdout stays a single clean JSON object but the
+# metric is still visible in the TUI pane. A silent program leaves FOM_LOG
+# empty (-s false) and prints nothing.
+if [[ -n "${FOM_LOG:-}" && -s "$FOM_LOG" ]]; then
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        {
+            echo "rocbudai-bench: ---- FOM command output (rep ${REPS}) ----"
+            cat "$FOM_LOG"
+            echo "rocbudai-bench: ---- end FOM command output ----"
+        } >&2
+    else
+        echo "rocbudai-bench: ---- FOM command output (rep ${REPS}) ----"
+        cat "$FOM_LOG"
+        echo "rocbudai-bench: ---- end FOM command output ----"
+    fi
+fi

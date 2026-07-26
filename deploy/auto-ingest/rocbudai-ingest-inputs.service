@@ -1,0 +1,35 @@
+[Unit]
+Description=rocBudAI — auto-ingest KB PDFs to .md sidecars
+Documentation=man:rocbudai(1)
+ConditionPathIsDirectory=/shareddata/rocbudai/docs/inputs
+
+# Don't fight the manual run: if an admin invoked the script by hand
+# (e.g. `rocbudai-ingest-inputs --force`), the script self-locks via
+# `flock` (see ExecStart wrapper); a second concurrent invocation just
+# blocks until the first completes.
+
+[Service]
+Type=oneshot
+
+# Run as `admin:adm` so the resulting .md sidecars match the rest of
+# /shareddata/rocbudai/docs/inputs/ ownership (admin owns, adm group
+# read-write). If we ran as root, the .md files would be root-owned
+# and admins would see permission warnings on subsequent edits.
+User=admin
+Group=adm
+
+# Use flock to ensure only one ingest at a time, even if the .path
+# unit fires in rapid succession (e.g. admin scp's 4 PDFs back-to-
+# back). `-n` would fail-fast on contention; we want to queue.
+ExecStart=/usr/bin/flock /var/lock/rocbudai-ingest-inputs.lock \
+    /shared/apps/ubuntu/opt/rocbudai/bin/rocbudai-ingest-inputs --dir /shareddata/rocbudai/docs/inputs
+
+# Be a polite cluster citizen — the ingest is not latency-sensitive
+# and we share the login node with other users.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+TimeoutStartSec=10min
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,57 @@
+# rocBudAI site configuration — copy to `site.conf` (next to install.sh) and
+# edit for your cluster. install.sh sources it, so this is the ONE file to edit
+# per site for the values below. Precedence: built-in defaults < site.conf <
+# CLI flags (e.g. --partition, --gfx-arch). `site.conf` is .gitignored.
+#
+# rocBudAI's production path requires Slurm + Lmod + systemd. If you do not
+# have that stack, use the container quick-test instead (./install.sh --container).
+#
+# NOTE: `./install.sh --container` IGNORES this file by design — the quick-test
+# is hermetic and always uses built-in defaults + the small container model.
+# You do NOT need a site.conf to run the container test.
+
+# --- install locations (shared filesystem) ---------------------------------
+INSTALL_ROOT="/shared/apps/ubuntu/opt/rocbudai"
+OPENCODE_ROOT="/shared/apps/ubuntu/opt/opencode"
+OPENCODE_VERSION="1.14.28"
+SITE_MODULES="/shared/apps/modules/ubuntu/lmodfiles/base"
+
+# Warewulf image rootfs (only used by the step-2 sidecar that bakes the ollama
+# unit into the compute-node image; ignore/leave empty if you deploy
+# differently). The image NAME for `wwctl container build` is derived from this
+# path's parent dir (Warewulf 4.x layout: <chroots>/<image-name>/rootfs).
+WAREWULF_CHROOT="/var/local/warewulf/chroots/ubuntu-24.04/rootfs"
+
+# --- model + Slurm gate -----------------------------------------------------
+# Default model pulled at install AND baked into the modulefile default +
+# allow-list (kept in sync automatically). Must be a tools-enabled tag.
+MODEL_NAME="qwen3.5:122b"
+
+# Comma-separated Slurm partition(s) rocBudAI may launch on (full-GPU/SPX
+# only; sliced CPX/TPX make the runner abort). "" disables the partition gate.
+SPX_PARTITIONS="PPAC_MI300A_SPX"
+
+# --- step-8 hardening paths (only used by the matching --with-* feature) ----
+# Slurm site prolog/epilog root. --with-comment-gating installs the drop-ins
+# under ${SLURMSCRIPTS_DIR}/{prolog.d,epilog.d}.
+SLURMSCRIPTS_DIR="/shared/share/slurmscripts"
+
+# Per-node local NVMe model-cache DESTINATION (--with-model-cache). The rsync
+# SOURCE is derived from OLLAMA_MODELS in the unit file, so it tracks the store
+# automatically — you do NOT set the source here.
+MODEL_CACHE_DIR="/var/local/cache/ollama"
+
+# KB inputs dir watched by the auto-ingest units (--with-auto-ingest). install.sh
+# retargets the deployed units to this path.
+# NOTE: the agent-side path is ALSO baked into the AGENTS personas + README,
+# which install.sh does NOT rewrite — a relocated KB needs those edited too.
+KB_INPUTS_DIR="/shareddata/rocbudai/docs/inputs"
+
+# --- NOT set here (single source of truth lives elsewhere, by design) -------
+# * Ollama model store path  -> Environment="OLLAMA_MODELS=..." in
+#                               deploy/ollama-daemon/ollama.service
+# * Ollama service user/UID   -> User=/Group= in the same unit file
+#   (the daemon reads the unit directly, so duplicating them here would desync).
+# * Auto-ingest service owner -> User=admin / Group=adm in
+#                               deploy/auto-ingest/rocbudai-ingest-inputs.service
+#   (edit if your KB-admin account/group differs from admin:adm).

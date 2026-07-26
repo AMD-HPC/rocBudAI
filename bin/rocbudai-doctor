@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-doctor — preflight diagnostic for rocBudAI.
+#
+# Runs a sequence of checks and prints a pass/fail summary. Designed to be
+# invoked:
+#
+#   1. Directly by users from the compute-node shell:
+#          $ rocbudai-doctor
+#      (after `module load rocbudai`, before `module load` triggers the TUI
+#      auto-launch; or after exiting the TUI to debug an issue).
+#
+#   2. By rocbudai-tui itself when an inline preflight check fails — the
+#      launcher tells the user "run rocbudai-doctor for full diagnostics"
+#      and the user can then see the complete picture.
+#
+# Exit codes:
+#   0 — all required checks passed.
+#   1 — one or more required checks failed (some checks are warn-only).
+#   2 — bad usage.
+#
+# This script is intentionally NOT `set -e`: we want every check to run, even
+# if earlier ones fail, so the user gets the complete picture in one shot.
+
+set -uo pipefail
+
+ROCBUDAI_ROOT="${ROCBUDAI_ROOT:-/shared/apps/ubuntu/opt/rocbudai}"
+ROCBUDAI_OPENCODE_BIN="${ROCBUDAI_OPENCODE_BIN:-/shared/apps/ubuntu/opt/opencode/1.14.28/opencode}"
+ROCBUDAI_OLLAMA_HOST="${ROCBUDAI_OLLAMA_HOST:-http://127.0.0.1:11434}"
+ROCBUDAI_MODEL="${ROCBUDAI_MODEL:-qwen3.5:122b}"
+ROCBUDAI_ALLOWED_MODELS="${ROCBUDAI_ALLOWED_MODELS:-qwen3.5:122b}"
+
+# Colour helpers — degrade gracefully on non-TTY (e.g. piped to a log).
+if [[ -t 1 ]]; then
+    C_OK=$'\e[32m'; C_FAIL=$'\e[31m'; C_WARN=$'\e[33m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
+else
+    C_OK=""; C_FAIL=""; C_WARN=""; C_DIM=""; C_RST=""
+fi
+
+PASS=0
+FAIL=0
+WARN=0
+
+ok()   { printf '  %s[ ok ]%s   %s\n'  "$C_OK"   "$C_RST" "$*"; PASS=$((PASS+1)); }
+fail() { printf '  %s[FAIL]%s   %s\n'  "$C_FAIL" "$C_RST" "$*"; FAIL=$((FAIL+1)); }
+warn() { printf '  %s[warn]%s   %s\n'  "$C_WARN" "$C_RST" "$*"; WARN=$((WARN+1)); }
+hint() { printf '          %s%s%s\n'   "$C_DIM"  "$*"     "$C_RST"; }
+
+usage() {
+    cat <<EOF
+rocbudai-doctor — environment preflight for rocBudAI
+
+USAGE:
+    rocbudai-doctor [-h|--help] [-q|--quiet]
+
+Runs a series of checks and prints pass/fail with actionable hints.
+Exit code 0 if all critical checks pass.
+
+ENVIRONMENT:
+    ROCBUDAI_OLLAMA_HOST       (default: http://127.0.0.1:11434)
+    ROCBUDAI_MODEL             (default: qwen3.5:122b)
+    ROCBUDAI_ALLOWED_MODELS    comma-separated allow-list
+    ROCBUDAI_OPENCODE_BIN      path to opencode binary
+EOF
+}
+
+QUIET=0
+case "${1:-}" in
+    -h|--help)  usage; exit 0 ;;
+    -q|--quiet) QUIET=1 ;;
+esac
+
+if [[ $QUIET -eq 0 ]]; then
+    echo "rocbudai-doctor — environment check"
+    printf "host: %s   user: %s   date: %s\n" "$(hostname)" "${USER:-?}" "$(date -Is)"
+    echo "──────────────────────────────────────────────────────────"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Slurm allocation
+# ---------------------------------------------------------------------------
+echo "1. Slurm allocation"
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    ok "container quick-test mode — Slurm/comment/partition gates not applicable (testing only)"
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    ok "in Slurm allocation: job ${SLURM_JOB_ID}"
+
+    # Resolve --comment and --partition from scontrol (authoritative). A
+    # salloc-spawned shell does NOT inherit SLURM_JOB_COMMENT (Slurm only
+    # sets that var in srun / sbatch / prolog / epilog contexts), and
+    # SLURM_JOB_PARTITION is unreliable across Slurm versions, so reading
+    # them directly will WARN even when the user did everything right.
+    # Mirror rocbudai-tui's scontrol-primary logic.
+    _scontrol_out=""
+    if command -v scontrol >/dev/null 2>&1; then
+        _scontrol_out="$(scontrol show job "$SLURM_JOB_ID" -o 2>/dev/null || true)"
+    fi
+    _job_comment=""
+    _job_partition=""
+    if [[ -n "$_scontrol_out" ]]; then
+        _job_comment="$(  echo "$_scontrol_out" | grep -oE 'Comment=[^[:space:]]+'   | head -1 | sed 's/^Comment=//')"
+        _job_partition="$(echo "$_scontrol_out" | grep -oE 'Partition=[^[:space:]]+' | head -1 | sed 's/^Partition=//')"
+        [[ "$_job_comment" == "(null)" ]] && _job_comment=""
+    fi
+    _job_comment="${_job_comment:-${SLURM_JOB_COMMENT:-}}"
+    _job_partition="${_job_partition:-${SLURM_JOB_PARTITION:-}}"
+
+    if [[ "${_job_comment}" == *ollama* ]]; then
+        ok "allocation comment contains 'ollama' (resolved via scontrol: '${_job_comment}')"
+    else
+        warn "allocation comment is '${_job_comment:-(unset)}', does not contain 'ollama'"
+        hint "ollama daemon and proxy are only started for jobs with --comment=ollama"
+        hint "without it, checks 3 and 4 below will fail"
+        hint "to fix:  scancel \$SLURM_JOB_ID && salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama -t 1:00:00"
+    fi
+
+    # Partition allow-list check. rocbudai-tui supports a comma-separated
+    # ROCBUDAI_SPX_PARTITIONS allow-list with substring matching; mirror it
+    # here so the two binaries agree on what counts as "supported".
+    # '-' (not ':-'): an empty ROCBUDAI_SPX_PARTITIONS disables the gate.
+    _spx_partitions="${ROCBUDAI_SPX_PARTITIONS-PPAC_MI300A_SPX}"
+    _spx_ok=0
+    for _p in ${_spx_partitions//,/ }; do
+        if [[ -n "$_p" && "${_job_partition}" == *"$_p"* ]]; then
+            _spx_ok=1
+            break
+        fi
+    done
+    if [[ -z "$_spx_partitions" ]]; then
+        ok "partition allow-list disabled (ROCBUDAI_SPX_PARTITIONS empty); partition '${_job_partition:-(unknown)}' accepted"
+    elif [[ "$_spx_ok" -eq 1 ]]; then
+        ok "on an allowed partition: '${_job_partition}'"
+    else
+        warn "partition is '${_job_partition:-(unknown)}', not in ROCBUDAI_SPX_PARTITIONS allow-list"
+        hint "allowed partitions: ${_spx_partitions}"
+        hint "the model needs enough full (SPX) GPUs; sliced modes (e.g. MI300A CPX/TPX) cause the runner to abort"
+    fi
+else
+    fail "not inside a Slurm allocation"
+    hint "from the login node:  salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama -t 1:00:00"
+    hint "then on the compute node:  module load rocbudai"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 2. AMD GPUs (rocm-smi)
+# ---------------------------------------------------------------------------
+echo "2. AMD GPUs"
+if ! command -v rocm-smi >/dev/null 2>&1; then
+    warn "rocm-smi not on PATH"
+    hint "the agent can still help with non-GPU profiling, but ROCm tools require it"
+elif ! rocm-smi --showid >/dev/null 2>&1; then
+    fail "rocm-smi present but cannot enumerate GPUs"
+    hint "kernel/driver issue, or a node in CPX mode? rocBudAI requires SPX mode"
+    hint "check:  rocm-smi --showid    (raw output)"
+else
+    # rocm-smi --csv --showid prints "card<N>,GPU ID" for each card; count.
+    # In container quick-test mode the LLM + bench share whatever GPUs are
+    # present, so a single GPU is fine; otherwise expect ROCBUDAI_MIN_GPUS.
+    _min_gpus="${ROCBUDAI_MIN_GPUS:-4}"
+    [[ -n "${ROCBUDAI_CONTAINER:-}" ]] && _min_gpus=1
+    ngpu="$(rocm-smi --csv --showid 2>/dev/null | tail -n +2 | grep -c '^card' || true)"
+    if [[ "${ngpu:-0}" -eq 0 ]]; then
+        fail "rocm-smi sees 0 GPUs"
+        hint "this node may be in a sliced GPU mode (e.g. MI300A CPX), incompatible with Ollama"
+    elif [[ "${ngpu}" -lt "${_min_gpus}" ]]; then
+        warn "rocm-smi sees ${ngpu} GPUs (expected at least ${_min_gpus})"
+        hint "the default model needs N-1 GPUs to serve and 1 reserved for rocbudai-bench"
+    else
+        ok "rocm-smi sees ${ngpu} GPUs"
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Ollama daemon reachable
+# ---------------------------------------------------------------------------
+echo "3. Ollama daemon"
+if ! command -v curl >/dev/null 2>&1; then
+    fail "curl not on PATH (cannot probe ollama)"
+elif ! curl -fsS --max-time 3 "${ROCBUDAI_OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+    fail "ollama daemon not reachable at ${ROCBUDAI_OLLAMA_HOST}"
+    hint "did you allocate with --comment=ollama? otherwise the prolog skips daemon start"
+    hint "check status:  systemctl is-active ollama ollama-proxy"
+    hint "check logs:    sudo journalctl -u ollama -n 30 --no-pager"
+else
+    ok "ollama reachable at ${ROCBUDAI_OLLAMA_HOST}"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 4. Canonical model present
+# ---------------------------------------------------------------------------
+echo "4. Model availability"
+# Match against /api/tags via a proper JSON parse rather than a grep
+# of the raw bytes — Ollama always stores pulled models with an
+# explicit tag (e.g. a bare 'qwen3.5' becomes 'qwen3.5:latest' on
+# disk), so a naive grep for the bare name with quote anchors fails
+# even when the model is in fact present. Accept both the literal
+# value of ROCBUDAI_MODEL and, if no tag was given, ROCBUDAI_MODEL:latest.
+_tags_json="$(curl -fsS --max-time 3 "${ROCBUDAI_OLLAMA_HOST}/api/tags" 2>/dev/null)"
+if [[ -z "${_tags_json}" ]]; then
+    warn "model availability could not be checked (daemon unreachable, see check 3)"
+else
+    if printf '%s' "${_tags_json}" | ROCBUDAI_MODEL="${ROCBUDAI_MODEL}" python3 -c "
+import json, os, sys
+want = os.environ.get('ROCBUDAI_MODEL', '')
+want_alt = want if ':' in want else want + ':latest'
+try:
+    names = [m.get('name', '') for m in json.load(sys.stdin).get('models', [])]
+except Exception:
+    sys.exit(2)
+sys.exit(0 if (want in names or want_alt in names) else 1)
+" 2>/dev/null; then
+        ok "model '${ROCBUDAI_MODEL}' is available on this node"
+    else
+        fail "model '${ROCBUDAI_MODEL}' is not in the ollama registry on this node"
+        hint "available models:"
+        printf '%s' "${_tags_json}" \
+            | python3 -c "import json,sys; [print('            '+m['name']) for m in json.load(sys.stdin).get('models',[])]" 2>/dev/null \
+            || hint "    (could not parse /api/tags response)"
+        hint "ask a cluster admin to:  sudo -u ollama ollama pull ${ROCBUDAI_MODEL}"
+    fi
+fi
+unset _tags_json
+echo
+
+# ---------------------------------------------------------------------------
+# 5. Model selection allow-list
+# ---------------------------------------------------------------------------
+echo "5. Model selection"
+# allow-list match: comma-bracketed substring search, robust to spaces.
+_normalised=",${ROCBUDAI_ALLOWED_MODELS// /},"
+if [[ "${_normalised}" == *",${ROCBUDAI_MODEL},"* ]]; then
+    ok "ROCBUDAI_MODEL='${ROCBUDAI_MODEL}' is in the allow-list"
+else
+    fail "ROCBUDAI_MODEL='${ROCBUDAI_MODEL}' is NOT in the admin allow-list"
+    hint "allowed: ${ROCBUDAI_ALLOWED_MODELS}"
+    hint "to fix:  unset ROCBUDAI_MODEL ; module load rocbudai"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 6. opencode binary
+# ---------------------------------------------------------------------------
+echo "6. opencode binary"
+if [[ ! -x "$ROCBUDAI_OPENCODE_BIN" ]]; then
+    fail "opencode binary not found / not executable: $ROCBUDAI_OPENCODE_BIN"
+    hint "is /shared/apps mounted on this node?    mount | grep '/shared/apps'"
+else
+    ver="$("$ROCBUDAI_OPENCODE_BIN" --version 2>/dev/null | head -1 || true)"
+    if [[ -n "$ver" ]]; then
+        ok "opencode found: ${ROCBUDAI_OPENCODE_BIN} (${ver})"
+    else
+        warn "opencode found but --version returned empty: ${ROCBUDAI_OPENCODE_BIN}"
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 7. Working directory
+# ---------------------------------------------------------------------------
+echo "7. Working directory"
+_pwd="$(pwd)"
+if [[ "$_pwd" == "$HOME" ]]; then
+    warn "current dir is \$HOME (${HOME}) — TUI will fall back to ~/rocbudai-runs/<timestamp>/"
+    hint "for in-place work on a project, cd into the project source first"
+elif [[ ! -w "$_pwd" ]]; then
+    fail "cwd not writable: ${_pwd}"
+    hint "the TUI needs to write opencode.json, AGENTS.md, .rocbudai-runtime.md here"
+else
+    ok "writable cwd: ${_pwd}"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 8. AGENTS.md / opencode.json templates available
+# ---------------------------------------------------------------------------
+echo "8. rocBudAI install tree"
+_share="${ROCBUDAI_ROOT}/share/rocbudai"
+_missing=()
+for f in AGENTS-default.md opencode-default.json opencode-allow-all.json ; do
+    if [[ ! -r "${_share}/${f}" ]]; then
+        _missing+=("${f}")
+    fi
+done
+if [[ ${#_missing[@]} -eq 0 ]]; then
+    ok "${_share} templates readable"
+else
+    fail "missing template(s) in ${_share}: ${_missing[*]}"
+    hint "is /shared/apps mounted? has the install tree been deployed?"
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 9. Leaked KFD processes for current user
+# ---------------------------------------------------------------------------
+echo "9. Leaked KFD processes"
+_reaper="${ROCBUDAI_ROOT}/bin/rocbudai-reap-stale"
+if [[ ! -x "$_reaper" ]]; then
+    warn "rocbudai-reap-stale not found at ${_reaper}"
+    hint "this check needs the SEV-3 Phase B reaper; install tree may be old"
+elif [[ ! -d /sys/class/kfd/kfd/proc ]]; then
+    warn "/sys/class/kfd/kfd/proc not present (amdkfd not loaded?)"
+    hint "this check needs the AMD KFD driver"
+else
+    # The reaper exits 0 (no leaks), 2 (leaks found in dry-run), or 3
+    # (env problem). Tap into all three; never run --reap from doctor.
+    _reaper_out="$("$_reaper" --quiet 2>&1)"
+    _reaper_rc=$?
+    if [[ $_reaper_rc -eq 0 ]]; then
+        ok "no leaked KFD processes for ${USER}"
+    elif [[ $_reaper_rc -eq 2 ]]; then
+        warn "leaked KFD processes detected for ${USER}"
+        hint "run: rocbudai-reap-stale         (to see the table)"
+        hint "then: rocbudai-reap-stale --reap (to clean them up)"
+        # Show a 1-line summary so the user knows the count without
+        # re-running the tool. The reaper's --quiet output suppresses
+        # headers but still emits the table; pluck the count from
+        # the warn line.
+        _leak_count="$(echo "$_reaper_out" | grep -oE '[0-9]+ leaked' | awk '{print $1}' | head -1)"
+        [[ -n "$_leak_count" ]] && hint "count: ${_leak_count}"
+    else
+        warn "rocbudai-reap-stale returned ${_reaper_rc} (environment issue)"
+        hint "check: rocbudai-reap-stale --help"
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 10. Project report.md (added after stress-test D-3, 2026-05-11)
+# ---------------------------------------------------------------------------
+#
+# If the current working directory contains a report.md (i.e. we are inside
+# a rocBudAI project dir), validate it against the AGENTS.md §6 schema. This
+# is the same check rocbudai-tui runs at /exit; surfacing it here lets the
+# user re-run after the fact (e.g. between sessions, or after a manual edit
+# to report.md, without launching the full TUI).
+echo "10. Project report.md"
+_report_path="$(pwd)/report.md"
+if [[ ! -f "$_report_path" ]]; then
+    ok "no report.md in cwd (skipping — not yet inside a project)"
+elif ! command -v python3 >/dev/null 2>&1; then
+    warn "report.md present but python3 not on PATH (cannot validate)"
+else
+    _report_check_output="$(
+        REPORT="$_report_path" python3 - <<'PY' 2>/dev/null || true
+import os, re, sys
+try:
+    text = open(os.environ['REPORT']).read()
+except Exception:
+    sys.exit(0)
+
+lines = text.splitlines()
+issues = []
+
+# 1) Every "## Iteration NN" header is followed by body content within 10
+#    lines (catches the empty-body half of D-3 finding #8).
+iter_hdr_re = re.compile(r'^## Iteration \d+', re.M)
+iter_hdrs = [(m.start(), m.group()) for m in iter_hdr_re.finditer(text)]
+for off, hdr in iter_hdrs:
+    line_no = text[:off].count('\n')
+    window = '\n'.join(lines[line_no + 1: line_no + 11]).strip()
+    if not window or window.startswith('## Iteration'):
+        issues.append(f'"{hdr}" at line {line_no+1} has empty body')
+
+# 2) Orphan content tail — text far from EOF after the LAST iteration
+#    header. Catches the orphan-baseline half of D-3 finding #8 where
+#    orphan content used bold (**Baseline**) rather than H2 headers.
+if iter_hdrs:
+    last_iter_off = iter_hdrs[-1][0]
+    last_iter_line = text[:last_iter_off].count('\n')
+    total_lines = len(lines)
+    lines_after_last_iter = total_lines - last_iter_line
+    if lines_after_last_iter > 80:
+        issues.append(
+            f'{lines_after_last_iter} lines after the last iteration '
+            f'(line {last_iter_line+1}) — possible orphan content')
+
+# 3) Files-modified table populated when iterations exist.
+if iter_hdrs and '## Files modified this session' in text:
+    fm_body = text.split('## Files modified this session', 1)[1].split('\n## ', 1)[0]
+    rows = [l for l in fm_body.splitlines()
+            if l.startswith('| /') or l.startswith('| ~')]
+    if not rows:
+        issues.append('Files-modified table is empty but iterations exist')
+
+# 4) [FACT] numbers should carry units (known dimensionless quantities
+#    like residue and iteration count are excluded).
+fact_lines = [l for l in lines if '[FACT]' in l]
+dimensionless_re = re.compile(
+    r'residue|iter(ations?|s)?\b|count|ratio|fraction|factor|index|rank',
+    re.I)
+unit_re = re.compile(
+    r'\d+(?:\.\d+)?\s*(?:µs|us|ms|ns|s\b|x\b|×|GB/s|TB/s|MB/s|KB/s|'
+    r'GFLOPS|TFLOPS|MB|GB|KB|TB|%)')
+big_num_re = re.compile(r'\d+\.\d|\d{2,}')
+unitless = [l for l in fact_lines
+            if big_num_re.search(l)
+            and not unit_re.search(l)
+            and not dimensionless_re.search(l)]
+if len(unitless) >= 3:
+    issues.append(f'{len(unitless)} [FACT] line(s) carry numbers without unit suffix')
+
+print(f'iterations={len(iter_hdrs)} issues={len(issues)}')
+for i in issues:
+    print(f'    {i}')
+PY
+)"
+    # Parse the summary line; rest is detail.
+    _summary="$(echo "$_report_check_output" | head -1)"
+    _details="$(echo "$_report_check_output" | tail -n +2)"
+    _n_iters="$(echo "$_summary" | grep -oE 'iterations=[0-9]+' | cut -d= -f2)"
+    _n_issues="$(echo "$_summary" | grep -oE 'issues=[0-9]+' | cut -d= -f2)"
+    if [[ "${_n_issues:-0}" -eq 0 ]]; then
+        ok "report.md (${_n_iters:-0} iterations) — schema PASS"
+    else
+        warn "report.md (${_n_iters:-?} iterations) — ${_n_issues} schema issue(s)"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && hint "$line"
+        done <<<"$_details"
+        hint "AGENTS.md §6 specifies the iteration template"
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 11. Local manifest blob completeness
+#     (added 2026-05-13 per Phase 9.4b post-mortem, item 4)
+# ---------------------------------------------------------------------------
+#
+# When a model is augmented via `ollama create -f Modelfile`, three NEW files
+# land in the local cache:
+#
+#   1. The manifest itself (manifests/registry.ollama.ai/library/<model>/<tag>)
+#   2. A regenerated config blob (~500 B) — pointed at by .config.digest
+#      in the manifest. This is the OCI image-config descriptor; it
+#      changes every time `ollama create` runs because the layer set
+#      changes.
+#   3. Each new layer blob added by the overlay (~700 B each for a SYSTEM
+#      block; can be MB / GB for added MODEL or PARAMS layers).
+#
+# Admin propagation flows that copy "the manifest" (a single file) without
+# also copying the config blob leave a manifest pointing at a non-existent
+# blob. Symptom: ollama logs `WARN msg="bad manifest filepath"` and
+# /api/tags returns {"models":[]} even though `ls manifests/...` shows the
+# manifest file is present. Recovery cost is small (1 KB per model), but
+# diagnosis is hard if you don't know to look at .config.digest.
+#
+# This check walks .config.digest and every .layers[].digest for every
+# manifest under the local ollama cache and reports any missing or
+# wrong-sized blobs. Independent of daemon state (reads files only); useful
+# when checks 3 or 4 above already failed.
+echo "11. Local manifest blob completeness"
+_ollama_cache="${ROCBUDAI_OLLAMA_CACHE:-/var/local/cache/ollama}"
+if [[ ! -d "${_ollama_cache}/manifests" ]]; then
+    warn "no ollama manifest cache at ${_ollama_cache}/manifests"
+    hint "set ROCBUDAI_OLLAMA_CACHE if your cache lives elsewhere"
+    hint "(this check is meaningful only on nodes that store ollama models locally)"
+elif ! command -v python3 >/dev/null 2>&1; then
+    warn "manifest completeness skipped (python3 not on PATH)"
+else
+    _manifest_check_output="$(
+        OLLAMA_CACHE="${_ollama_cache}" python3 - <<'PY' 2>/dev/null || true
+import json
+import os
+import sys
+
+cache = os.environ['OLLAMA_CACHE']
+manifests_root = os.path.join(cache, 'manifests')
+blobs_root = os.path.join(cache, 'blobs')
+
+found = 0
+broken = 0
+results = []
+
+for dp, _dns, fns in os.walk(manifests_root):
+    for fn in fns:
+        mpath = os.path.join(dp, fn)
+        rel = os.path.relpath(mpath, manifests_root)
+        try:
+            m = json.load(open(mpath))
+        except Exception as e:
+            results.append((rel, ['manifest parse error: ' + str(e)]))
+            broken += 1
+            continue
+        found += 1
+        digests = []
+        cfg = m.get('config', {})
+        if cfg.get('digest'):
+            digests.append(('config', cfg['digest'], cfg.get('size', 0)))
+        for layer in m.get('layers', []):
+            mt = layer.get('mediaType', '?').rsplit('.', 1)[-1]
+            digests.append((mt, layer.get('digest', ''), layer.get('size', 0)))
+        missing = []
+        for kind, digest, size in digests:
+            if ':' not in digest:
+                missing.append(kind + ': malformed digest ' + repr(digest))
+                continue
+            blob = os.path.join(blobs_root, 'sha256-' + digest.split(':')[1])
+            if not os.path.exists(blob):
+                missing.append(kind + ': blob ' + digest + ' missing (' + str(size) + ' B)')
+            else:
+                actual = os.path.getsize(blob)
+                if actual != size:
+                    missing.append(kind + ': blob ' + digest + ' size ' + str(actual) + ' != expected ' + str(size))
+        if missing:
+            broken += 1
+            results.append((rel, missing))
+
+print('found=' + str(found) + ' broken=' + str(broken))
+for rel, msgs in results:
+    print('    ' + rel + ':')
+    for m in msgs:
+        print('        ' + m)
+PY
+)"
+    _summary="$(echo "$_manifest_check_output" | head -1)"
+    _details="$(echo "$_manifest_check_output" | tail -n +2)"
+    _found="$(echo "$_summary" | grep -oE 'found=[0-9]+' | cut -d= -f2)"
+    _broken="$(echo "$_summary" | grep -oE 'broken=[0-9]+' | cut -d= -f2)"
+    if [[ -z "${_found:-}" ]]; then
+        warn "manifest completeness check produced no output"
+        hint "cache permissions issue? try: ls -la ${_ollama_cache}/manifests"
+    elif [[ "${_found:-0}" -eq 0 ]]; then
+        ok "no manifests in ${_ollama_cache} (no models pulled on this node yet)"
+    elif [[ "${_broken:-0}" -eq 0 ]]; then
+        ok "${_found} manifest(s) under ${_ollama_cache} — all blobs present, sizes match"
+    else
+        warn "${_broken} of ${_found} manifest(s) reference missing or wrong-sized blobs"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && hint "$line"
+        done <<<"$_details"
+        hint "see docs/airgap-and-model-pulls.md step 8b for the propagation recipe"
+        hint "and deploy/ollama-models/README.md \"Operational gotcha\" section"
+        hint "this is an admin-only fix — the missing blob lives on whichever node"
+        hint "ran 'ollama create -f Modelfile' last. ask the admin to copy it."
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+if [[ $QUIET -eq 0 ]]; then
+    echo "──────────────────────────────────────────────────────────"
+    printf "  pass: %s%d%s    fail: %s%d%s    warn: %s%d%s\n" \
+        "$C_OK"   "$PASS" "$C_RST" \
+        "$C_FAIL" "$FAIL" "$C_RST" \
+        "$C_WARN" "$WARN" "$C_RST"
+    if [[ $FAIL -eq 0 && $WARN -eq 0 ]]; then
+        printf "  %sall checks passed — rocBudAI is ready.%s\n" "$C_OK" "$C_RST"
+    elif [[ $FAIL -eq 0 ]]; then
+        printf "  %sno blocking failures. Warnings are advisory.%s\n" "$C_OK" "$C_RST"
+    else
+        printf "  %sblocking failures present — rocbudai-tui will refuse to launch.%s\n" \
+            "$C_FAIL" "$C_RST"
+    fi
+    echo "──────────────────────────────────────────────────────────"
+fi
+
+[[ $FAIL -gt 0 ]] && exit 1
+exit 0

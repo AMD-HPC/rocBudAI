@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-prune-sessions — interactively delete old opencode sessions
+# for the current project directory.
+#
+# Why this exists:
+#   `opencode session list` is global. Even after you `rm -rf` a project
+#   directory's files, every session you ever opened from that cwd still
+#   shows up in the `module load rocbudai` picker. This helper lets you
+#   prune them without copy-pasting `opencode session delete <id>` for
+#   each one.
+#
+# USAGE
+#   rocbudai-prune-sessions             # interactive prune for sessions in cwd
+#   rocbudai-prune-sessions --dry-run   # show what would be deleted, but don't
+#   rocbudai-prune-sessions --all-runs  # include sessions under ~/rocbudai-runs/*/
+#   rocbudai-prune-sessions -h | --help
+#
+# SELECTION SYNTAX (interactive prompt)
+#   1,3,5-7    delete entries 1, 3, 5, 6, 7
+#   all        delete every entry shown
+#   <empty>|q  cancel
+#
+# WHAT IT DOES
+#   For each selected session it runs `opencode session delete <id>` and,
+#   if a `<project-dir>/.rocbudai-sessions.json` sidecar contains an entry
+#   for that ID, removes the entry from the sidecar so the picker's name
+#   cache stays in sync.
+#
+# EXIT CODES
+#   0  success (or cancelled / nothing-to-prune)
+#   1  one or more deletes failed
+#   2  bad usage
+
+set -euo pipefail
+
+ROCBUDAI_OPENCODE_BIN="${ROCBUDAI_OPENCODE_BIN:-/shared/apps/ubuntu/opt/opencode/1.14.28/opencode}"
+
+DRY_RUN=0
+SCOPE="project"
+
+err()  { echo "[rocbudai-prune-sessions] error: $*" >&2; }
+info() { echo "[rocbudai-prune-sessions] $*"; }
+
+usage() {
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run|-n)  DRY_RUN=1;     shift ;;
+        --all-runs|-a) SCOPE="all-runs"; shift ;;
+        -h|--help)     usage; exit 0 ;;
+        *)             err "unknown argument: $1"; usage >&2; exit 2 ;;
+    esac
+done
+
+# 1. Get the global session list and filter to relevant scope. -----------------
+# (Same filter logic as the picker in rocbudai-tui: `project` matches cwd
+# exactly; `all-runs` matches anything under $HOME/rocbudai-runs/.)
+
+cwd="$(pwd)"
+
+SESSIONS_JSON="$("$ROCBUDAI_OPENCODE_BIN" session list --format json 2>/dev/null || echo '[]')"
+
+MENU="$(
+    SESSIONS_JSON="$SESSIONS_JSON" SCOPE="$SCOPE" CWD="$cwd" HOME_DIR="$HOME" \
+    python3 - <<'PY'
+import json, os, time
+
+def humanize_age(updated_ms):
+    if not updated_ms:
+        return "?"
+    age = time.time() - (updated_ms / 1000.0)
+    if age <  60:    return f"{int(age)}s ago"
+    if age <  3600:  return f"{int(age/60)}m ago"
+    if age <  86400: return f"{int(age/3600)}h ago"
+    return f"{int(age/86400)}d ago"
+
+scope = os.environ['SCOPE']
+cwd   = os.environ['CWD']
+home  = os.environ['HOME_DIR']
+runs_prefix = os.path.join(home, 'rocbudai-runs') + '/'
+
+try:
+    sessions = json.loads(os.environ.get('SESSIONS_JSON') or '[]')
+except Exception:
+    sessions = []
+
+if scope == 'project':
+    cands = [x for x in sessions if x.get('directory') == cwd]
+else:
+    cands = [x for x in sessions if (x.get('directory') or '').startswith(runs_prefix)]
+
+cands.sort(key=lambda x: -x.get('updated', 0))
+
+sidecar_cache = {}
+def lookup_name(d, sid):
+    if not d:
+        return None
+    sf = os.path.join(d, '.rocbudai-sessions.json')
+    if sf not in sidecar_cache:
+        try:
+            sidecar_cache[sf] = json.load(open(sf))
+        except Exception:
+            sidecar_cache[sf] = {}
+    return sidecar_cache[sf].get(sid, {}).get('name')
+
+rows = []
+for c in cands:
+    rows.append({
+        'id':        c['id'],
+        'directory': c.get('directory') or '',
+        'title':     c.get('title') or '',
+        'name':      lookup_name(c.get('directory') or '', c['id']),
+        'age':       humanize_age(c.get('updated')),
+    })
+
+print(json.dumps({'count': len(rows), 'scope': scope, 'rows': rows}))
+PY
+)"
+
+COUNT="$(MENU="$MENU" python3 -c "import os,json; print(json.loads(os.environ['MENU'])['count'])")"
+
+if [[ "${COUNT:-0}" -eq 0 ]]; then
+    if [[ "$SCOPE" == "project" ]]; then
+        info "no sessions found for this project (${cwd})."
+        info "(if you launched from \$HOME, try:  rocbudai-prune-sessions --all-runs)"
+    else
+        info "no sessions found under \$HOME/rocbudai-runs/."
+    fi
+    exit 0
+fi
+
+# 2. Render the menu. ----------------------------------------------------------
+
+echo
+if [[ "$SCOPE" == "project" ]]; then
+    info "${COUNT} session(s) in this project (${cwd}):"
+else
+    info "${COUNT} session(s) under \$HOME/rocbudai-runs/:"
+fi
+
+MENU="$MENU" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ['MENU'])
+for i, r in enumerate(d['rows'], start=1):
+    label = r['name'] or r['title'] or '(unnamed)'
+    if d['scope'] == 'all-runs':
+        short = r['directory'].rsplit('/', 1)[-1] or r['directory']
+        print(f"    [{i:>2}] {label:<32} {r['age']:<8}  ({short})  {r['id']}")
+    else:
+        print(f"    [{i:>2}] {label:<40} {r['age']:<8}  {r['id']}")
+PY
+echo
+echo "  Selection syntax: '1,3,5-7'  |  'all'  |  empty/q cancels"
+
+read -r -p "  prune: " sel || sel=""
+sel="${sel## }"; sel="${sel%% }"
+
+if [[ -z "$sel" ]] || [[ "$sel" =~ ^[qQ]$ ]] || [[ "$sel" =~ ^(quit|cancel)$ ]]; then
+    info "cancelled."
+    exit 0
+fi
+
+# 3. Parse the selection into a list of 1-based indices. -----------------------
+
+SEL="$(MENU="$MENU" SEL_RAW="$sel" python3 - <<'PY' || true
+import json, os, re, sys
+d = json.loads(os.environ['MENU'])
+n = d['count']
+sel = os.environ['SEL_RAW'].strip().lower()
+if sel == 'all':
+    print(' '.join(str(i+1) for i in range(n)))
+    sys.exit(0)
+out = set()
+for tok in re.split(r'[,\s]+', sel):
+    if not tok:
+        continue
+    if '-' in tok:
+        a, b = tok.split('-', 1)
+        try:
+            a, b = int(a), int(b)
+        except Exception:
+            sys.exit(1)
+        if a < 1 or b > n or a > b:
+            sys.exit(1)
+        for i in range(a, b + 1):
+            out.add(i)
+    else:
+        try:
+            i = int(tok)
+        except Exception:
+            sys.exit(1)
+        if i < 1 or i > n:
+            sys.exit(1)
+        out.add(i)
+print(' '.join(str(i) for i in sorted(out)))
+PY
+)"
+
+if [[ -z "$SEL" ]]; then
+    err "invalid selection '$sel' (expected '1,3,5-7', 'all', or 'q')."
+    exit 2
+fi
+
+# 4. Show what will be deleted, then confirm. ----------------------------------
+
+n_sel="$(echo "$SEL" | wc -w | tr -d ' ')"
+echo
+info "${n_sel} session(s) selected to prune:"
+for idx in $SEL; do
+    MENU="$MENU" IDX="$idx" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ['MENU'])
+i = int(os.environ['IDX']) - 1
+r = d['rows'][i]
+label = r['name'] or r['title'] or '(unnamed)'
+print(f"    [{int(os.environ['IDX']):>2}] {label}  ({r['id']})")
+PY
+done
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    info "dry run: nothing was deleted."
+    exit 0
+fi
+
+echo
+read -r -p "  confirm delete [y/N]: " confirm || confirm=""
+case "$confirm" in
+    y|Y|yes|YES|ok|OK|go|GO) ;;
+    *) info "cancelled."; exit 0 ;;
+esac
+
+# 5. Delete. --------------------------------------------------------------------
+
+DELETED=0
+FAILED=0
+for idx in $SEL; do
+    sid="$(MENU="$MENU" IDX="$idx" python3 -c "
+import json, os
+print(json.loads(os.environ['MENU'])['rows'][int(os.environ['IDX'])-1]['id'])")"
+    sdir="$(MENU="$MENU" IDX="$idx" python3 -c "
+import json, os
+print(json.loads(os.environ['MENU'])['rows'][int(os.environ['IDX'])-1]['directory'])")"
+
+    echo "  deleting ${sid}…"
+    if "$ROCBUDAI_OPENCODE_BIN" session delete "$sid" >/dev/null 2>&1; then
+        DELETED=$((DELETED + 1))
+        # Best-effort: prune the matching sidecar entry, if any.
+        if [[ -n "$sdir" && -f "${sdir}/.rocbudai-sessions.json" ]]; then
+            SID="$sid" SF="${sdir}/.rocbudai-sessions.json" python3 - <<'PY' || true
+import json, os
+sf  = os.environ['SF']
+sid = os.environ['SID']
+try:
+    d = json.load(open(sf))
+except Exception:
+    d = {}
+if sid in d:
+    del d[sid]
+    with open(sf, 'w') as f:
+        json.dump(d, f, indent=2, sort_keys=True)
+        f.write('\n')
+PY
+        fi
+    else
+        FAILED=$((FAILED + 1))
+        err "  failed to delete ${sid}"
+    fi
+done
+
+echo
+info "done: deleted=${DELETED}  failed=${FAILED}"
+[[ $FAILED -gt 0 ]] && exit 1
+exit 0

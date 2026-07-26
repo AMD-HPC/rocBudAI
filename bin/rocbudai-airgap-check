@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-airgap-check — verify the cluster's rocBudAI airgap baseline
+#                        is in force on the current compute node.
+#
+# WHY THIS EXISTS
+#   Every rocBudAI job inherits a cluster-wide airgap baseline that
+#   keeps source code, prompts, model output, AND user-side commands
+#   on the cluster while the allocation is running:
+#
+#     1. Managed /etc/opencode/opencode.json with `share: disabled`
+#        and 14 cloud providers explicitly disabled. Overrides any
+#        project-local opencode.json. Live-verified via
+#        `opencode debug config` (section 3c below).
+#     2. OPENCODE_DISABLE_AUTOUPDATE / _LSP_DOWNLOAD / _MODELS_FETCH /
+#        _EXTERNAL_SKILLS / _SHARE env vars set by the modulefile —
+#        suppress every known opencode phone-home call site.
+#     3. ollama-egress.service — boot-time nft owner-match egress block
+#        on the `ollama` UID that REJECTs external traffic and only
+#        permits loopback / cluster DNS / RFC1918.
+#     4. rocbudai-user-egress.service + Slurm prolog/epilog — boot-time
+#        nft skeleton table that the prolog extends with a per-job chain
+#        blocking the user UID's external egress for the duration of the
+#        allocation; the epilog tears it down. Loopback / cluster DNS /
+#        RFC1918 remain reachable.
+#     5. OLLAMA_NOPRUNE=1 + OLLAMA_NO_CLOUD=1 in the systemd unit
+#        for the ollama daemon (no cloud handshake, no auto-pull).
+#     6. ollama daemon bound to 127.0.0.1:11435 (loopback only),
+#        fronted by ollama-proxy on 127.0.0.1:11434.
+#
+#   Together these guarantee that source code, prompts, model output,
+#   AND user-side commands stay on the cluster while the allocation
+#   is running. This tool gives users a way to *verify* that promise
+#   after they allocate with `--comment=ollama` — without needing sudo.
+#
+#   NOTE — what this does NOT cover:
+#     - Out-of-job state: the user UID block is per-job. Outside an
+#       allocation, your UID has full network egress (by design — admin
+#       tools and pre-staging dependencies need it). If you need to
+#       fetch something external (pip wheels, git over HTTPS, model
+#       downloads), do it BEFORE allocating with --comment=ollama.
+#     - The login node has unrestricted egress (no allocation, so no
+#       per-job egress chain is installed).
+#     - Recursive DNS via the cluster resolver: queries for external
+#       names still resolve (returned IPs are kernel-blocked anyway,
+#       so the channel is unusable for meaningful data exfil).
+#     - Cluster admins are trusted (they can read NFS contents,
+#       inspect process memory, etc.).
+#
+# USAGE
+#   rocbudai-airgap-check                # run all user-visible checks
+#   rocbudai-airgap-check --deep         # also run sudo-only checks
+#                                          (nft table contents, ollama
+#                                          daemon environment)
+#   rocbudai-airgap-check -h | --help
+#
+# EXIT CODES
+#   0 — all hardening checks passed (the airgap promise is intact).
+#   1 — one or more failures (the airgap promise is degraded).
+#   2 — bad usage / not on a compute node.
+
+set -uo pipefail
+
+ROCBUDAI_OLLAMA_HOST="${ROCBUDAI_OLLAMA_HOST:-http://127.0.0.1:11434}"
+DEEP=0
+
+usage() {
+    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+    -h|--help)  usage; exit 0 ;;
+    --deep)     DEEP=1 ;;
+    "")         ;;
+    *)          echo "[rocbudai-airgap-check] error: unknown argument: $1" >&2
+                usage >&2; exit 2 ;;
+esac
+
+# Colour helpers (degrade gracefully on non-TTY).
+if [[ -t 1 ]]; then
+    C_OK=$'\e[32m'; C_FAIL=$'\e[31m'; C_WARN=$'\e[33m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
+else
+    C_OK=""; C_FAIL=""; C_WARN=""; C_DIM=""; C_RST=""
+fi
+
+PASS=0
+FAIL=0
+WARN=0
+
+ok()   { printf '  %s[ ok ]%s   %s\n'  "$C_OK"   "$C_RST" "$*"; PASS=$((PASS+1)); }
+fail() { printf '  %s[FAIL]%s   %s\n'  "$C_FAIL" "$C_RST" "$*"; FAIL=$((FAIL+1)); }
+warn() { printf '  %s[warn]%s   %s\n'  "$C_WARN" "$C_RST" "$*"; WARN=$((WARN+1)); }
+hint() { printf '          %s%s%s\n'   "$C_DIM"  "$*"     "$C_RST"; }
+
+echo "rocbudai-airgap-check — verify the cluster airgap baseline is in force"
+printf "host: %s   user: %s   date: %s\n" "$(hostname)" "${USER:-?}" "$(date -Is)"
+echo "──────────────────────────────────────────────────────────"
+
+# ---------------------------------------------------------------------------
+# 1. Compute node + ollama allocation
+# ---------------------------------------------------------------------------
+echo "1. Allocation"
+# If the user ssh'd into this node (e.g. via pam_slurm_adopt) instead of
+# running through srun, SLURM_JOB_ID will not be in the shell env. Recover
+# it from squeue: the user's unique RUNNING job on this node.
+if [[ -z "${SLURM_JOB_ID:-}" ]] && command -v squeue >/dev/null 2>&1; then
+    _adopted=$(squeue -h -w "$(hostname -s)" -u "$USER" -t R -o '%i' 2>/dev/null)
+    if [[ -n "$_adopted" && $(printf '%s\n' "$_adopted" | wc -l) -eq 1 ]]; then
+        export SLURM_JOB_ID="$_adopted"
+    fi
+    unset _adopted
+fi
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    fail "not in a Slurm allocation — this tool must run on a compute node."
+    hint "from a login node:  salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama -t 1:00:00"
+    echo
+    echo "Aborting — the airgap baseline is per-compute-node and cannot be verified from a login shell."
+    exit 2
+fi
+ok "in Slurm allocation: job ${SLURM_JOB_ID}"
+
+# Resolve the allocation Comment via scontrol (authoritative). A
+# salloc-spawned shell does NOT inherit SLURM_JOB_COMMENT (Slurm only
+# sets that var in srun / sbatch / prolog / epilog contexts), so reading
+# it directly will FAIL even when the user did everything right.
+# Mirror rocbudai-doctor's scontrol-primary logic (which itself mirrors
+# rocbudai-tui).
+_scontrol_out=""
+if command -v scontrol >/dev/null 2>&1; then
+    _scontrol_out="$(scontrol show job "$SLURM_JOB_ID" -o 2>/dev/null || true)"
+fi
+_job_comment=""
+if [[ -n "$_scontrol_out" ]]; then
+    _job_comment="$(echo "$_scontrol_out" | grep -oE 'Comment=[^[:space:]]+' | head -1 | sed 's/^Comment=//')"
+    [[ "$_job_comment" == "(null)" ]] && _job_comment=""
+fi
+_job_comment="${_job_comment:-${SLURM_JOB_COMMENT:-}}"
+
+case "$_job_comment" in
+    *ollama*) ok "allocation comment contains 'ollama' (resolved via scontrol: '${_job_comment}'; daemon + egress block were started)" ;;
+    *)        fail "allocation comment is '${_job_comment:-(unset)}', not 'ollama'"
+              hint "without --comment=ollama, the prolog skips daemon start and egress block install."
+              hint "release this allocation and re-run with:  salloc ... --comment=ollama" ;;
+esac
+echo
+
+# ---------------------------------------------------------------------------
+# 2. ollama daemon + ollama-proxy reachable
+# ---------------------------------------------------------------------------
+echo "2. ollama daemon + proxy"
+if ! command -v curl >/dev/null 2>&1; then
+    fail "curl not on PATH — cannot probe ollama loopback endpoint."
+elif ! curl -fsS --max-time 3 "${ROCBUDAI_OLLAMA_HOST}/api/version" >/dev/null 2>&1; then
+    fail "ollama not reachable at ${ROCBUDAI_OLLAMA_HOST}/api/version"
+    hint "loopback path opencode → ollama-proxy:11434 → ollama:11435 is broken."
+    hint "check:  systemctl is-active ollama ollama-proxy"
+else
+    ver="$(curl -fsS --max-time 3 "${ROCBUDAI_OLLAMA_HOST}/api/version" 2>/dev/null \
+            | python3 -c "import json,sys;print(json.load(sys.stdin).get('version','?'))" 2>/dev/null \
+            || echo '?')"
+    ok "ollama loopback reachable at ${ROCBUDAI_OLLAMA_HOST} (version ${ver})"
+fi
+
+# Service-state probes (work without sudo on most setups).
+for svc in ollama ollama-proxy ollama-egress; do
+    state="$(systemctl is-active "${svc}.service" 2>/dev/null || echo unknown)"
+    case "$state" in
+        active)
+            ok "${svc}.service is active"
+            ;;
+        inactive|failed|unknown)
+            if [[ "$svc" == "ollama-egress" ]]; then
+                fail "${svc}.service is ${state} — egress block on ollama UID is NOT installed."
+                hint "this is the rule that REJECTs ollama → external. Without it the airgap is broken."
+                hint "check:  systemctl status ollama-egress.service"
+            else
+                fail "${svc}.service is ${state} (the loopback path requires this unit running)."
+            fi
+            ;;
+        *)
+            warn "${svc}.service state: ${state}"
+            ;;
+    esac
+done
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Managed /etc/opencode/opencode.json
+# ---------------------------------------------------------------------------
+echo "3. Managed opencode config (/etc/opencode/opencode.json)"
+mgcfg=/etc/opencode/opencode.json
+if [[ ! -r "$mgcfg" ]]; then
+    fail "${mgcfg} not readable — opencode auto-update + cloud sharing are NOT pinned off."
+    hint "without the managed config, a project-local opencode.json could re-enable cloud features."
+    hint "check:  ls -la ${mgcfg}    (sysadmin must drop deploy/airgap/opencode-managed.json there)"
+else
+    # Use python for robust JSON parsing.
+    res="$(MGCFG="$mgcfg" python3 - <<'PY'
+import json, os, sys
+mg = os.environ['MGCFG']
+try:
+    d = json.load(open(mg))
+except Exception as e:
+    print(f"PARSE_FAIL\t{e}")
+    sys.exit(0)
+share     = d.get('share', '<missing>')
+disabled  = d.get('disabled_providers') or d.get('disabledProviders') or []
+print(f"OK\tshare={share}\tdisabled_providers={len(disabled)}")
+PY
+)"
+    case "$res" in
+        PARSE_FAIL*)
+            fail "${mgcfg} present but not parseable as JSON: ${res#PARSE_FAIL	}"
+            ;;
+        OK*)
+            share="$(echo "$res" | awk -F'\t' '{print $2}')"
+            ndis="$(echo "$res" | awk -F'\t' '{print $3}')"
+            if [[ "$share" == "share=disabled" ]]; then
+                ok "opencode share: disabled"
+            else
+                fail "opencode ${share} (expected 'disabled' — session transcripts could be uploaded)"
+            fi
+            n="${ndis#disabled_providers=}"
+            if [[ "$n" -ge 10 ]]; then
+                ok "opencode disabled_providers: ${n} cloud providers blocked"
+            elif [[ "$n" -gt 0 ]]; then
+                warn "opencode disabled_providers: only ${n} blocked (expected ~14)"
+            else
+                fail "opencode disabled_providers: 0 — cloud providers (anthropic, openai, etc.) are NOT blocked at config level"
+            fi
+            ;;
+    esac
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 3c. opencode actually accepts the managed config (not silently rejected)
+# ---------------------------------------------------------------------------
+# `opencode debug config` runs opencode's config resolver (no TUI, no
+# network needed) and either prints the resolved JSON or an "Error:
+# Configuration is invalid" / "Unrecognized key:" message. The exit code is
+# unreliable (0 on errors too), so we grep stderr. This check catches the
+# class of bug where the JSON parses fine to Python but opencode 1.14.28's
+# strict schema validator rejects it and silently falls back to defaults
+# (which would disable the JSON-level `share` and `disabled_providers`
+# enforcement without anyone noticing).
+echo "3c. opencode accepts the managed config (live resolver check)"
+oc_bin="${ROCBUDAI_OPENCODE_BIN:-/shared/apps/ubuntu/opt/opencode/1.14.28/opencode}"
+if [[ ! -x "$oc_bin" ]]; then
+    warn "opencode binary not at ${oc_bin} — skipping live resolver check"
+else
+    # cd /tmp to avoid picking up a project-local opencode.json override.
+    oc_out="$(cd /tmp && "$oc_bin" debug config 2>&1 || true)"
+    if echo "$oc_out" | grep -qE 'Configuration is invalid|Unrecognized key:|^Error:'; then
+        fail "opencode REJECTS the managed config — share/disabled_providers silently ignored."
+        echo "$oc_out" | sed 's/^/         /' | head -5
+        hint "this means the JSON-level airgap enforcement is OFF; fix /etc/opencode/opencode.json"
+    else
+        # Verify expected keys actually made it through the resolver.
+        verify="$(OC_JSON="$oc_out" python3 - 2>&1 <<'PY'
+import json, os, sys
+try:
+    d = json.loads(os.environ["OC_JSON"])
+except Exception as e:
+    print(f"PARSE_FAIL\t{e}")
+    sys.exit(0)
+share = d.get("share", "<missing>")
+dis   = d.get("disabled_providers") or []
+print(f"OK\tshare={share}\tn_disabled={len(dis)}")
+PY
+)"
+        case "$verify" in
+            PARSE_FAIL*)
+                fail "opencode debug config emitted unparseable JSON: ${verify#PARSE_FAIL	}"
+                ;;
+            OK*)
+                share="$(echo "$verify" | awk -F'\t' '{print $2}')"
+                ndis="$(echo "$verify" | awk -F'\t' '{print $3}')"
+                if [[ "$share" == "share=disabled" ]]; then
+                    ok "opencode resolves share=disabled"
+                else
+                    fail "opencode resolves ${share} (expected 'disabled') — silent fallback?"
+                fi
+                n="${ndis#n_disabled=}"
+                if [[ "$n" -ge 10 ]]; then
+                    ok "opencode resolves ${n} disabled cloud providers"
+                else
+                    fail "opencode resolves only ${n} disabled providers (expected ≥10)"
+                fi
+                ;;
+        esac
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 3b. opencode phone-home env vars (set by modulefile)
+# ---------------------------------------------------------------------------
+# opencode 1.14.28 silently ignores the JSON "autoupdate" key (verified by
+# strings(1) against the binary — the literal key is absent). The actual
+# disable for auto-update + LSP downloads + models-catalog fetch + external
+# skills + share lives in five OPENCODE_DISABLE_* env vars (which DO appear
+# in the binary's env-var table). The rocbudai modulefile sets them on
+# `module load rocbudai`. This block verifies they made it through.
+echo "3b. opencode phone-home env vars (set by modulefile)"
+for v in OPENCODE_DISABLE_AUTOUPDATE \
+         OPENCODE_DISABLE_LSP_DOWNLOAD \
+         OPENCODE_DISABLE_MODELS_FETCH \
+         OPENCODE_DISABLE_EXTERNAL_SKILLS \
+         OPENCODE_DISABLE_SHARE; do
+    if [[ -n "${!v:-}" && "${!v}" != "0" && "${!v}" != "false" ]]; then
+        ok "${v}=${!v}"
+    else
+        fail "${v} not set (or set to 0/false) — opencode auto-phone-home is NOT suppressed."
+        hint "expected to be exported by the rocbudai modulefile."
+        hint "verify with:  module load rocbudai && env | grep OPENCODE_DISABLE"
+    fi
+done
+echo
+
+# ---------------------------------------------------------------------------
+# 4. ollama daemon environment hardening (NOPRUNE + NO_CLOUD)
+# ---------------------------------------------------------------------------
+echo "4. ollama daemon environment"
+# `systemctl show ollama -p Environment` works without sudo and prints all
+# Environment= lines from the unit. It does NOT show the live process's
+# /proc/<pid>/environ (that's UID-restricted), but it shows what systemd
+# launched the daemon with, which is what we care about.
+env_blob="$(systemctl show ollama.service -p Environment --value 2>/dev/null || true)"
+if [[ -z "$env_blob" ]]; then
+    warn "could not read ollama.service Environment= (systemctl show returned empty)"
+    hint "this is unusual; deeper check requires sudo: sudo systemctl cat ollama.service"
+else
+    if echo "$env_blob" | grep -q 'OLLAMA_NOPRUNE=1'; then
+        ok "OLLAMA_NOPRUNE=1 (no background update probe)"
+    else
+        fail "OLLAMA_NOPRUNE=1 is NOT set in ollama.service Environment=."
+    fi
+    if echo "$env_blob" | grep -q 'OLLAMA_NO_CLOUD=1'; then
+        ok "OLLAMA_NO_CLOUD=1 (cloud feature handshake disabled)"
+    else
+        fail "OLLAMA_NO_CLOUD=1 is NOT set in ollama.service Environment=."
+    fi
+    if echo "$env_blob" | grep -q 'OLLAMA_HOST=127.0.0.1'; then
+        ok "ollama bound to 127.0.0.1 (loopback only — no external listener)"
+    else
+        warn "ollama bind address not 127.0.0.1 (check OLLAMA_HOST in unit)."
+    fi
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 5. (deep) nft table contents — requires sudo
+# ---------------------------------------------------------------------------
+if [[ $DEEP -eq 1 ]]; then
+    echo "5. nft egress block (deep, requires sudo)"
+    if ! command -v sudo >/dev/null 2>&1; then
+        warn "sudo not on PATH — skipping deep nft inspection."
+    elif ! sudo -n nft list table inet ollama_egress >/dev/null 2>&1; then
+        fail "table 'inet ollama_egress' not loaded (sudo nft list failed)."
+        hint "either ollama-egress.service did not apply, or sudo password required."
+        hint "retry interactively:  sudo nft list table inet ollama_egress"
+    else
+        ok "nft table 'inet ollama_egress' loaded"
+        # Spot-check for the owner-match rule against the ollama UID.
+        ollama_uid="$(getent passwd ollama 2>/dev/null | cut -d: -f3)"
+        if [[ -n "$ollama_uid" ]] && \
+           sudo -n nft list table inet ollama_egress 2>/dev/null \
+                | grep -qE "skuid ${ollama_uid}|skuid \"ollama\""; then
+            ok "owner-match rule found for ollama UID ${ollama_uid}"
+        else
+            warn "could not confirm owner-match rule for ollama UID (may use different syntax)."
+            hint "manual inspection:  sudo nft list table inet ollama_egress"
+        fi
+        # Also check the user-UID egress table is loaded + has the current
+        # user's per-job chain.
+        if sudo -n nft list table inet rocbudai_user_egress >/dev/null 2>&1; then
+            ok "nft table 'inet rocbudai_user_egress' loaded"
+            cur_uid="$(id -u)"
+            if sudo -n nft list table inet rocbudai_user_egress 2>/dev/null \
+                    | grep -qE "skuid ${cur_uid}\b.*jump job_${SLURM_JOB_ID}"; then
+                ok "per-job chain job_${SLURM_JOB_ID} active for UID ${cur_uid}"
+            else
+                warn "no active per-job chain for UID ${cur_uid} job ${SLURM_JOB_ID} (was prolog run?)"
+                hint "manual inspection:  sudo nft list table inet rocbudai_user_egress"
+            fi
+        else
+            warn "nft table 'inet rocbudai_user_egress' not loaded — user-UID egress block inactive on this node"
+            hint "expected service:  rocbudai-user-egress.service"
+        fi
+    fi
+    echo
+else
+    hint "(re-run with --deep to inspect nft table contents — requires sudo)"
+    echo
+fi
+
+# ---------------------------------------------------------------------------
+# 6. User UID egress (kernel-level block, enforced if comment contains 'ollama')
+# ---------------------------------------------------------------------------
+echo "6. User UID egress"
+if curl -fsS --max-time 3 -o /dev/null --head https://huggingface.co/ 2>/dev/null; then
+    fail "your UID can reach https://huggingface.co/ — user-UID egress block is NOT in force."
+    hint "expected behaviour for any --comment=ollama allocation: external HTTPS rejected."
+    hint "diagnose:  systemctl status rocbudai-user-egress.service ; sudo nft list table inet rocbudai_user_egress"
+else
+    ok "your UID cannot reach https://huggingface.co/ — egress block active."
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 7. (deep) Telemetry hygiene — admin-only daily usage log
+# ---------------------------------------------------------------------------
+#
+# Structural sanity checks on /var/log/rocbudai-usage.jsonl, the file
+# /etc/cron.daily/rocbudai-harvest writes to. The file is mode 0600
+# root:root by design (admin-only observability, no user-facing opt-out
+# needed because the file is unreadable to users), so this section only
+# runs under --deep AND only does anything useful as root.
+#
+# Two structural guarantees are checked:
+#   (a) Row size cap (1 KiB). Every legitimate row is ~250 bytes; a
+#       prompt or model response would blow past 1 KiB instantly. If
+#       this ever fires it means the harvester started capturing
+#       content it shouldn't.
+#   (b) Key allow-list. Each row must contain only the documented
+#       counter keys. A new key appearing means someone changed the
+#       harvester — review it before the next nightly run.
+#
+# This is the same logic /etc/cron.daily/rocbudai-airgap-probe runs
+# unattended every 24 h; running it here lets an admin spot-check on
+# demand.
+if [[ $DEEP -eq 1 ]]; then
+    echo "7. Telemetry hygiene (deep, requires root)"
+    USAGE_LOG="${ROCBUDAI_USAGE_LOG:-/var/log/rocbudai-usage.jsonl}"
+    if [[ ! -e "$USAGE_LOG" ]]; then
+        warn "${USAGE_LOG} does not exist yet."
+        hint "first row appears the day after /etc/cron.daily/rocbudai-harvest is installed."
+    elif [[ ! -r "$USAGE_LOG" ]]; then
+        if [[ $EUID -ne 0 ]]; then
+            warn "${USAGE_LOG} not readable (need root)."
+            hint "retry as:  sudo rocbudai-airgap-check --deep"
+        else
+            fail "${USAGE_LOG} exists but is not readable even as root (?)"
+        fi
+    else
+        perm="$(stat -c '%a %U:%G' "$USAGE_LOG" 2>/dev/null || echo '?')"
+        if [[ "$perm" == "600 root:root" ]]; then
+            ok "${USAGE_LOG} is mode 600 root:root"
+        else
+            fail "${USAGE_LOG} perms are '${perm}' (expected '600 root:root')"
+            hint "fix:  chown root:root ${USAGE_LOG} && chmod 0600 ${USAGE_LOG}"
+        fi
+
+        oversize="$(awk 'length > 1024 {print NR; exit}' "$USAGE_LOG")"
+        if [[ -z "$oversize" ]]; then
+            ok "no row exceeds 1024 bytes (structural guarantee that no prompt/response leaked)"
+        else
+            fail "row ${oversize} in ${USAGE_LOG} exceeds 1024 bytes — possible content leak"
+            hint "inspect:  awk 'NR==${oversize}' ${USAGE_LOG} | head -c 200"
+        fi
+
+        bad="$(USAGE_LOG="$USAGE_LOG" python3 - <<'PY'
+import json, os, sys
+SCHEMA = {
+    "daily_usage": {
+        "event", "date", "user", "account",
+        "n_allocations", "total_minutes", "clean_exit_rate",
+        "n_sessions_named", "n_sessions_with_report",
+        "report_bytes_total", "returned_via_continue",
+    },
+    "hygiene_check": {
+        "event", "date", "status", "reason", "detail",
+    },
+}
+for n, line in enumerate(open(os.environ["USAGE_LOG"]), 1):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        print(f"line {n}: not valid JSON")
+        sys.exit(0)
+    ev = d.get("event")
+    if ev not in SCHEMA:
+        print(f"line {n}: unknown event '{ev}'")
+        sys.exit(0)
+    extra = set(d.keys()) - SCHEMA[ev]
+    if extra:
+        print(f"line {n}: event '{ev}' has unexpected keys {sorted(extra)}")
+        sys.exit(0)
+PY
+)"
+        if [[ -z "$bad" ]]; then
+            ok "every row matches its per-event schema (daily_usage / hygiene_check)"
+        else
+            fail "${bad}"
+            hint "an unexpected field appeared — review the harvester or probe schema"
+        fi
+
+        # Latest hygiene_check row tells us what the unattended watchdog saw.
+        # Parse via python — JSON whitespace is non-canonical so a literal
+        # grep can miss valid rows.
+        last_check="$(USAGE_LOG="$USAGE_LOG" python3 - <<'PY'
+import json, os
+last = None
+for line in open(os.environ["USAGE_LOG"]):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if d.get("event") == "hygiene_check":
+        last = d
+if last:
+    print(f"{last.get('status','')}|{last.get('date','')}|{last.get('reason','')}")
+PY
+)"
+        if [[ -n "$last_check" ]]; then
+            status="${last_check%%|*}"
+            rest="${last_check#*|}"
+            cdate="${rest%%|*}"
+            reason="${rest#*|}"
+            if [[ "$status" == "ok" ]]; then
+                ok "last unattended hygiene check (${cdate}) was ok"
+            else
+                fail "last unattended hygiene check (${cdate}) was '${status}' (${reason})"
+                hint "inspect:  python3 -c \"import json;[print(l) for l in open('${USAGE_LOG}') if 'hygiene_check' in l]\" | tail -3"
+            fi
+        else
+            warn "no hygiene_check row in ${USAGE_LOG} yet — has the watchdog run?"
+        fi
+    fi
+    echo
+else
+    hint "(re-run with --deep, as root, to inspect /var/log/rocbudai-usage.jsonl hygiene)"
+    echo
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo "──────────────────────────────────────────────────────────"
+echo "Summary:  ${C_OK}${PASS} pass${C_RST}   ${C_FAIL}${FAIL} fail${C_RST}   ${C_WARN}${WARN} warn${C_RST}"
+echo
+if [[ $FAIL -gt 0 ]]; then
+    echo "${C_FAIL}One or more airgap-baseline checks FAILED — opencode/ollama hardening is degraded.${C_RST}"
+    echo "Report this to your cluster admin (logs:  journalctl -u ollama -u ollama-proxy -u ollama-egress)."
+    exit 1
+fi
+
+cat <<'EOF'
+The airgap baseline appears intact:
+  - opencode session sharing + cloud providers are pinned off via the
+    managed /etc/opencode/opencode.json; opencode auto-update / LSP
+    download / models-catalog fetch / external-skills / share are also
+    suppressed via OPENCODE_DISABLE_* env vars set by the modulefile.
+  - the ollama daemon's external egress is blocked at the kernel level
+    (nft owner-match on the ollama UID via ollama-egress.service).
+  - the daemon will not initiate cloud handshakes (OLLAMA_NO_CLOUD=1)
+    or background update probes (OLLAMA_NOPRUNE=1).
+  - ollama only listens on loopback (127.0.0.1).
+  - YOUR OWN egress is also blocked at the kernel level: every external
+    destination from your UID is REJECTed for the duration of this
+    --comment=ollama allocation (nft rocbudai_user_egress, installed by
+    the Slurm prolog and torn down by the epilog). Only loopback,
+    cluster DNS, and RFC1918 (NFS / Slurm / internal services) remain
+    reachable.
+
+Source code, prompts, model output, AND user-side commands stay on
+the cluster while this allocation is running. If you need to fetch
+something external (pip wheels, git over HTTPS, model downloads),
+stage it BEFORE allocating with --comment=ollama, or use a separate
+allocation without that comment.
+EOF
+exit 0

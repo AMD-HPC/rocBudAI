@@ -1,0 +1,847 @@
+.\" /shared/apps/ubuntu/man/man1/rocbudai.1
+.TH "ROCBUDAI" "1" "2026-06-02" "rocBudAI" "rocBudAI User Commands"
+.SH NAME
+rocbudai \- AMD GPU profiling and optimisation AI assistant
+.SH SYNOPSIS
+.B rocbudai
+[\fB\-\-continue\fR|\fB\-c\fR]
+[\fB\-\-new\fR|\fB\-n\fR]
+.PP
+.B rocbudai \-h
+|
+.B rocbudai \-\-help
+.PP
+\fBrocbudai\fR must run on a Slurm\-allocated compute node; it has
+no login\-node mode (allocate the node yourself with \fBsalloc\fR
+first \(em see \fBQUICK START\fR).
+.SH DESCRIPTION
+\fBrocBudAI\fR is an AI\-powered performance\-engineering assistant for
+AMD GPU clusters, packaged as a Lmod module.
+It wires the OpenCode coding TUI to a locally\-hosted qwen3.5:122b
+model served by Ollama and is pre\-seeded with knowledge of the AMD
+profiling stack (\fBrocprofv3\fR, \fBrocprof\-compute\fR,
+\fBrocprof\-sys\fR, \fBrocpd\fR, \fBrocm\-smi\fR).
+.PP
+.B Privacy / airgap.
+rocBudAI runs entirely on the cluster.
+Your source code, profiling data, and every chat turn stay on the
+allocated compute node \(em they are never sent to any external
+service while the \fB\-\-comment=ollama\fR job is running.
+The model is served by a local \fBollama\fR daemon, and the kernel
+firewall blocks external network egress from BOTH the \fBollama\fR
+uid (always, via \fBollama\-egress.service\fR at boot) AND your own
+user uid (per\-job, via \fBrocbudai\-user\-egress.service\fR plus a
+prolog\-installed nft chain torn down by the epilog).
+Audited on demand by \fBrocbudai\-airgap\-check\fR(1).
+See also the \fBAIRGAP\fR section below for the full enforcement
+mechanism.
+.PP
+After a seven\-question discovery interview the agent iteratively
+builds, profiles, analyses, and optimises the user's code, writing a
+running \fBreport.md\fR as it goes.
+All work runs on the allocated compute node.
+The reference platform is MI300A in SPX mode; the architecture is
+GPU\-agnostic.
+.PP
+The locally\-served model is wrapped with rocbudai\-specific
+operating rules at the SYSTEM\-prompt level (5 turn\-invalidating
+hard rules: one question per turn, median\-only headline numbers,
+no raw \fBEdit\fR on \fBreport.md\fR, profile before iter01 changes,
+re\-Read modified files before re\-editing).
+The full ruleset with rationale lives in \fBAGENTS.md\fR (loaded as
+session context); the SYSTEM overlay enforces the most\-violated
+subset at the inference root.
+See \fBdeploy/ollama-models/README.md\fR in the rocbudai source tree
+for the overlay design, application flow, and rollback procedure.
+.SH QUICK START
+You need a cluster account and the ability to allocate a full-GPU (SPX)
+MI300A compute node (on the reference cluster, partition
+\fBPPAC_MI300A_SPX\fR).
+.PP
+.RS 4
+.nf
+\fB# 1. From a login node, allocate an exclusive SPX GPU node.\fR
+\fB#    \-p selects the SPX MI300A partition; \-\-comment=ollama tells the\fR
+\fB#    cluster's job_submit logic to start the ollama daemon on the\fR
+\fB#    node for you.\fR
+salloc \-p PPAC_MI300A_SPX \-\-exclusive \-\-comment=ollama \-\-time=02:00:00
+
+\fB# 2. cd into your source tree (rocBudAI works wherever you point\fR
+\fB#    it \(em it never copies your code).\fR
+cd ~/my-app
+
+\fB# 3. Load the module. The OpenCode TUI auto\-launches with the agent\fR
+\fB#    pre-configured for the AMD profiling workflow.\fR
+module load rocbudai
+.fi
+.RE
+.PP
+There is no login\-node shortcut: \fBmodule load rocbudai\fR and
+\fBrocbudai\fR both refuse to run without a Slurm allocation and
+print the \fBsalloc\fR command above.
+You must allocate the compute node yourself.
+.SH SEVEN-QUESTION DISCOVERY INTERVIEW
+After the TUI starts the agent asks seven short questions, one at a
+time:
+.IP \(bu 2
+\fBQ1/7\fR \(em session name (short label used to find this session
+again from the \fBmodule load rocbudai\fR picker; see
+\fBSESSION MANAGEMENT\fR)
+.IP \(bu 2
+\fBQ2/7\fR \(em application type (HIP/C++? PyTorch? Fortran+OpenMP?
+MPI?)
+.IP \(bu 2
+\fBQ3/7\fR \(em ROCm version (which \fBrocm/<ver>\fR module to load)
+.IP \(bu 2
+\fBQ4/7\fR \(em other modules (compilers, MPI, libraries)
+.IP \(bu 2
+\fBQ5/7\fR \(em build instructions (your build command, or path to a
+build script).
+If you do not have source code yet \(em just learning the stack \(em
+answer "no source"; the agent will offer to clone an upstream example
+from \fBhttps://github.com/amd/HPCTrainingExamples\fR matching your
+Q2 answer.
+.IP \(bu 2
+\fBQ6/7\fR \(em run command (how to launch the binary with a
+representative input)
+.IP \(bu 2
+\fBQ7/7\fR \(em figure of merit (what number defines "faster" for
+your application)
+.PP
+After Q7 the agent echoes the plan, asks for confirmation, then runs
+the build \(-> profile \(-> analyse \(-> optimise \(-> re\-profile
+loop.
+.SH PERMISSION MODES
+By default the agent runs in \fBASK\fR mode: every non\-trivial bash
+command pauses for a \fBy\fR/\fBEnter\fR approval.
+Read\-only commands are pre\-approved (\fBls\fR, \fBcat\fR,
+\fBhead\fR, \fBtail\fR, \fBwc\fR, \fBstat\fR, \fBfile\fR,
+\fBgrep\fR, \fBrg\fR, \fBfind\fR, \fBtree\fR, the
+\fBmodule\fR query subcommands \(em \fBlist\fR / \fBavail\fR /
+\fBspider\fR / \fBshow\fR, and the AMD GPU probes
+\fBrocm\-smi\fR / \fBrocminfo\fR) so the agent does not nag you
+for trivial introspection.
+The full allow\-list lives in the managed \fB./opencode.json\fR
+(per\-project) and \fB/etc/opencode/opencode.json\fR
+(cluster\-wide).
+.PP
+.B AUTO\-RUN mode
+\(em commands run without per\-call approval, but a small set of
+dangerous patterns (\fBrm \-rf /\fR, \fBmodule purge\fR, \fBmkfs\fR,
+\fBshutdown\fR, \fBreboot\fR) remain hard\-denied at the opencode
+layer.
+.PP
+.RS 4
+.nf
+\fB# Inside the TUI:\fR
+/exit
+
+\fB# Then on the compute node:\fR
+export ROCBUDAI_AUTORUN=1
+module load rocbudai          \fI# (or: rocbudai \-\-continue)\fR
+.fi
+.RE
+.PP
+To go back to ASK mode: \fBunset ROCBUDAI_AUTORUN\fR (or
+\fBexport ROCBUDAI_AUTORUN=0\fR), then \fBmodule load rocbudai\fR or
+\fBrocbudai \-\-continue\fR.
+.SH SESSION MANAGEMENT
+Exit the TUI with \fB/exit\fR or \fBCtrl\-D\fR.
+You remain on the compute node inside your Slurm allocation.
+.PP
+.RS 4
+.nf
+\fBmodule load rocbudai\fR         \fI# show picker if prior sessions exist; else fresh\fR
+\fBrocbudai \-\-continue\fR          \fI# resume the last session in this dir (skip picker)\fR
+\fBrocbudai \-\-new\fR               \fI# force a fresh session (skip picker)\fR
+\fBrocbudai\-prune\-sessions\fR     \fI# interactively delete old sessions (see below)\fR
+.fi
+.RE
+.PP
+.B Session picker.
+A no-flag \fBmodule load rocbudai\fR (or \fBrocbudai\fR with no resume
+flag, run on the compute node) shows an interactive numbered menu of
+prior sessions associated with the launching cwd, sorted most-recent
+first. Pick a number to resume, \fBn\fR to start a new session, or
+\fBq\fR to cancel. The picker is bypassed when \fB\-\-continue\fR
+or \fB\-\-new\fR is passed (or the corresponding
+\fBROCBUDAI_CONTINUE\fR / \fBROCBUDAI_NEW\fR env var is set), and when
+stdin/stdout is not a TTY.
+.PP
+.B Session names.
+The first discovery question (\fBQ1/7\fR) asks the user for a short
+name. The agent persists it via \fBrocbudai\-name\-session "<name>"\fR
+into \fB./.rocbudai\-sessions.json\fR (project\-scoped sidecar). The
+picker shows that name next time the user comes back to this dir, so
+sessions are findable by intent rather than by cryptic
+\fBses_\fR\fIID\fR\fR. Names are best\-effort: if the user skips the
+question, the picker falls back to opencode's auto\-generated title.
+.PP
+.B Filter scope.
+When the launching cwd is a normal writable directory, the picker
+shows only sessions whose project directory equals it. When the
+launching cwd is \fB$HOME\fR or unwritable, the picker shows
+sessions across every \fB~/rocbudai\-runs/*/\fR subdir, so the user
+gets the same UX regardless of where they reloaded the module from;
+picking a session chdirs to its original project dir before launch.
+.PP
+.B Pruning old sessions.
+opencode\(cqs session storage is global \(em deleting files in a project
+directory does \fBnot\fR remove the sessions that were opened from
+that directory, so the picker can fill up with stale entries (and with
+opencode\(cqs auto\-generated titles for sessions that predate the
+\fBQ1/7\fR session\-naming feature).
+Run \fBrocbudai\-prune\-sessions\fR to interactively delete the
+unwanted entries:
+.PP
+.RS 4
+.nf
+\fBrocbudai\-prune\-sessions\fR             \fI# project scope; pick by index (1,3,5\-7) or "all"\fR
+\fBrocbudai\-prune\-sessions \-\-dry\-run\fR    \fI# show what would be deleted, without deleting\fR
+\fBrocbudai\-prune\-sessions \-\-all\-runs\fR   \fI# scope to ~/rocbudai\-runs/*/ (use from $HOME)\fR
+.fi
+.RE
+.PP
+The helper calls \fBopencode session delete\fR for each chosen ID and
+removes any matching entry from
+\fB./.rocbudai\-sessions.json\fR so the picker\(cqs name cache stays
+in sync.
+.PP
+opencode keys session storage by \fBproject directory\fR (cwd at
+launch).
+To resume a session you must end up in the directory the session was
+created in \(em the picker handles that automatically.
+If the original session was auto\-created from \fB$HOME\fR (see
+\fBWORKING DIRECTORY\fR below), \fBrocbudai \-\-continue\fR run again
+from \fB$HOME\fR will resume the most recent
+\fB~/rocbudai\-runs/\fR\fIsubdir\fR automatically.
+.SH WORKING DIRECTORY
+The directory you launch \fBrocbudai\fR from is treated as the
+project: \fBAGENTS.md\fR, \fBopencode.json\fR,
+\fB.rocbudai\-runtime.md\fR, and \fBreport.md\fR are written there,
+and opencode keys session storage on it.
+.PP
+If the launching cwd is \fB$HOME\fR or is not writable, the launcher
+substitutes a fresh project directory under
+\fB~/rocbudai\-runs/\fR\fItimestamp\fR\fB/\fR (so \fB$HOME\fR is not
+cluttered with scratch files, and so opencode's per\-session git
+snapshot does not interact with the rest of \fB$HOME\fR).
+The auto\-created directory persists after logout; the welcome banner
+prints its absolute path.
+.PP
+For \fB\-\-continue\fR / \fB\-\-session\fR the launcher does \fBnot\fR
+mint a fresh directory; it resolves to the most recent existing
+\fB~/rocbudai\-runs/*/\fR instead, so the session is actually found.
+If no prior session directories exist, the launcher refuses with a
+clear message rather than dropping you into an empty TUI.
+.SH AIRGAP BASELINE
+Every \fB\-\-comment=ollama\fR allocation inherits a cluster\-wide
+airgap baseline that keeps source code, prompts, model output,
+\fBand\fR user\-side commands on the cluster while the job runs:
+.IP \(bu 2
+Managed \fB/etc/opencode/opencode.json\fR pins
+\fB"share": "disabled"\fR and disables 14 cloud providers
+(anthropic, openai, etc.). Overrides any project\-local
+\fBopencode.json\fR. The modulefile additionally sets
+\fBOPENCODE_DISABLE_{AUTOUPDATE,LSP_DOWNLOAD,MODELS_FETCH,EXTERNAL_SKILLS,SHARE}=1\fR
+so every known opencode phone\-home call site is suppressed.
+.IP \(bu 2
+\fBollama\-egress.service\fR installs an nft owner\-match egress
+block on the \fBollama\fR UID at boot. External traffic from that
+UID is REJECTed; only loopback, cluster DNS, and RFC1918 are
+permitted.
+.IP \(bu 2
+\fBrocbudai\-user\-egress.service\fR loads an nft skeleton table at
+boot, and the Slurm prolog extends it with a per\-job chain that
+REJECTs external traffic from the \fBuser's UID\fR for the duration
+of the allocation. Loopback, cluster DNS, and RFC1918 remain
+reachable. The epilog tears the per\-job chain down.
+.IP \(bu 2
+The systemd unit for the ollama daemon sets \fBOLLAMA_NOPRUNE=1\fR
+and \fBOLLAMA_NO_CLOUD=1\fR (no cloud feature handshake, no
+background update probes), and binds the daemon to
+\fB127.0.0.1:11435\fR (loopback only).
+.PP
+Source code, prompts, model output, and user\-side commands all
+stay on the cluster while the allocation is running.
+.PP
+.B What this does NOT cover.
+The user\-UID block is per\-job. \fBOutside\fR an allocation, your
+UID has full network egress \(em by design, so admin tooling and
+pre\-staging dependencies work. If you need to fetch something
+external (\fBpip install\fR, \fBgit clone https://...\fR, model
+downloads), do it BEFORE allocating with \fB\-\-comment=ollama\fR.
+The login node also has unrestricted egress (no allocation, no
+per\-job chain). Recursive DNS via the cluster resolver still
+returns external IPs, but those IPs are kernel\-blocked, so the
+channel is unusable for meaningful exfil. Cluster admins are
+trusted.
+.PP
+.B Verifying the baseline.
+After \fBmodule load rocbudai\fR on a compute node, run:
+.PP
+.RS 4
+.nf
+\fBrocbudai\-airgap\-check\fR              \fI# user-visible probes (no sudo)\fR
+\fBrocbudai\-airgap\-check \-\-deep\fR       \fI# also inspect nft table contents (sudo)\fR
+.fi
+.RE
+.PP
+The tool reports pass / fail / warn for the four hardening pieces
+above and prints clear hints if anything is degraded. Exit code 0
+means the airgap is intact.
+.SH REPORT FORMAT
+The agent writes and updates \fBreport.md\fR in the project directory
+across the build \(-> profile \(-> analyse \(-> optimise loop.
+Non\-trivial claims are tagged so a reader can distinguish measured
+data from interpretation:
+.TP
+.B [FACT]
+Directly measured in the run, stated in source/API headers, or
+trivially reproducible from artifacts on disk.
+.TP
+.B [INFERENCE]
+Interpretation consistent with the facts but not proven; confounds
+called out explicitly.
+.TP
+.B [OPINION]
+A recommendation or judgement call \(em distinct from inference.
+.SH KNOWLEDGE BASE
+The cluster admin maintains a curated knowledge base of profiling
+slides, papers, and internal notes under
+.PP
+.RS 4
+.nf
+\fB/shareddata/rocbudai/docs/inputs/\fR
+.fi
+.RE
+.PP
+The agent lists this directory at session start, reads the \fB.md\fR
+sidecars it judges relevant to your workload type, and cites them in
+\fBreport.md\fR.
+You can extend the KB yourself by dropping files into the same
+directory:
+.IP \(bu 2
+\fB.pdf\fR \(em a \fBsystemd.path\fR watcher on the login node
+auto\-converts to a \fB.md\fR sidecar within seconds.
+The PDF stays archival; the agent only ever reads the sidecar.
+.IP \(bu 2
+\fB.md\fR / \fB.txt\fR / \fB.html\fR \(em read directly, no
+conversion needed.
+.PP
+New files appear to the agent at the start of the next session.
+Files dropped mid\-session are not noticed automatically; ask the
+agent in chat to re\-list the directory if needed.
+The agent always ignores a file named \fBREADME.md\fR in this
+directory \(em do not use that name.
+.SS Naming convention
+Recommended (the workload\-type prefix lets the agent skip files
+unrelated to your run):
+.PP
+.RS 4
+.nf
+\fI<workload-type>\fR__\fI<topic>\fR__\fI<source>\fR__\fI<yyyymmdd>\fR.\fI<ext>\fR
+.fi
+.RE
+.PP
+Workload\-type tags: \fBhip-cpp\fR, \fBhip-fortran\fR, \fBpytorch\fR,
+\fBtensorflow\fR, \fBjax\fR, \fBmpi\fR, \fBomp\fR, \fBgeneral\fR
+(applies to any workload).
+.PP
+Examples:
+.PP
+.RS 4
+.nf
+hip-cpp__rocprofv3-quickstart__amd-public__20260301.pdf
+pytorch__torch-profiler-recipes__pytorch-org__20260115.md
+mpi__rocprof-sys-mpi__amd-blog__20260420.pdf
+general__rocm-7.2-release-notes__amd__20260225.md
+.fi
+.RE
+.SS YAML front-matter for hand-authored Markdown
+The PDF ingest pipeline auto-prepends YAML front-matter so the agent
+can cite the source filename and judge freshness from the extraction
+date.
+For a Markdown file you author by hand, follow the same convention:
+.PP
+.RS 4
+.nf
+\fB\-\-\-\fR
+\fBsource:\fR my-internal-writeup
+\fBextracted_at:\fR 2026-04-30
+\fBworkload_type:\fR pytorch
+\fB\-\-\-\fR
+
+# Title
+
+(content...)
+.fi
+.RE
+.PP
+Without front-matter the agent will still read the file, but it
+cannot cite the provenance precisely or down\-weight stale notes.
+.SH OPTIONS
+.TP
+.BR \-\-continue ", " \-c
+Resume the most recent opencode session in the project directory
+(bypasses the session picker; see \fBSESSION MANAGEMENT\fR).
+opencode keys session storage by cwd, so launch from the same
+directory as the original session.
+If you originally ran from \fB$HOME\fR, run \fB\-\-continue\fR from
+\fB$HOME\fR \(em the launcher will resolve to the most recent
+\fB~/rocbudai\-runs/*/\fR.
+.TP
+.BR \-\-new ", " \-n
+Force a fresh opencode session, bypassing the session picker even
+when prior sessions exist for the launching cwd.
+See \fBSESSION MANAGEMENT\fR for picker behaviour.
+.TP
+.BR \-h ", " \-\-help
+Print short usage and exit.
+.SH ENVIRONMENT
+.TP
+.B ROCBUDAI_AUTORUN
+\fB1\fR / \fBtrue\fR / \fByes\fR / \fBon\fR enables AUTO\-RUN mode.
+\fB0\fR / \fBfalse\fR / \fBno\fR / \fBoff\fR (or unset) selects ASK
+mode (default).
+.TP
+.B ROCBUDAI_CONTINUE
+If set to a non\-empty value, equivalent to passing
+\fB\-\-continue\fR.
+.TP
+.B ROCBUDAI_NEW
+If set to a non\-empty value, equivalent to passing \fB\-\-new\fR
+(forces a fresh session, bypassing the picker).
+.TP
+.B ROCBUDAI_AGENTS_NOREFRESH
+If set, the launcher does not auto\-refresh \fBAGENTS.md\fR from the
+canonical template when the template is newer.
+Equivalent to \fBchmod 0444 AGENTS.md\fR.
+.TP
+.B ROCBUDAI_OPENCODE_NOREFRESH
+If set, the launcher does not auto\-refresh \fBopencode.json\fR from
+the canonical template when the template is newer.
+Equivalent to \fBchmod 0444 opencode.json\fR.
+.TP
+.B ROCBUDAI_MODEL
+Ollama model name. Defaults to \fBqwen3.5:122b\fR.
+Must be in the cluster admin's allow\-list
+(\fBROCBUDAI_ALLOWED_MODELS\fR).
+End users normally do not override this.
+.IP
+On this cluster the allow\-list currently contains:
+.RS
+.IP \(bu 2
+\fBqwen3.5:122b\fR \(em the default (since 2026\-06\-08).
+.IP \(bu 2
+\fBgpt\-oss:120b\fR \(em opt\-in alternative (the previous default;
+OpenAI gpt\-oss MoE).
+(\fBexport ROCBUDAI_MODEL=gpt\-oss:120b\fR before \fBmodule load rocbudai\fR).
+.IP \(bu 2
+\fBnemotron\-3\-super:120b\fR \(em opt\-in alternative
+(\fBexport ROCBUDAI_MODEL=nemotron\-3\-super:120b\fR before \fBmodule load rocbudai\fR).
+.RE
+.TP
+.B ROCBUDAI_NUDGE_AFTER_S
+Idle seconds after the assistant turn ends before the auto\-nudge
+watcher injects a \fB"continue"\fR prompt.
+Defaults to \fB240\fR.
+Raise (e.g. \fB360\fR) if you find the watcher firing while you are
+still reading or composing your next message; lower (e.g. \fB60\fR)
+if you want a tighter loop at the cost of more false positives.
+The watcher fires at most once per user message regardless of value.
+The nudge is a regular user message (opencode 1.14.28 has no hidden
+channel exposed to plugins or to outside posters), so it appears
+verbatim in the chat transcript.
+.TP
+.B ROCBUDAI_NUDGE_DISABLE
+Set to \fB1\fR before \fBmodule load rocbudai\fR to skip launching the
+auto\-nudge watcher entirely for this session. No nudges; if the
+agent stops mid\-turn you wake it up manually with any prompt.
+.TP
+.B ROCBUDAI_NUDGE_TEXT
+Override the text the watcher posts (default \fBcontinue\fR).
+Rarely needed; useful for A/B testing alternative nudge phrasings.
+.TP
+.B ROCBUDAI_NUDGE_LOG
+Absolute path to which the watcher appends diagnostics
+(\fBsession.idle\fR arrivals, nudge fire / skip reasons, POST
+outcomes). Empty / unset (default) \(em silent.
+Suggested for debugging:
+\fBexport ROCBUDAI_NUDGE_LOG=$HOME/.cache/rocbudai/nudge.log\fR
+(create the parent directory first).
+.SH FILES
+.TP
+.B ./AGENTS.md
+Agent persona, hard rules, seven\-question script, recovery procedures,
+and report format. Auto\-refreshed from the canonical template when
+the template is newer.
+.TP
+.B ./opencode.json
+opencode TUI configuration (model, permissions, denied commands).
+Auto\-refreshed from the canonical template when newer.
+.TP
+.B ./.rocbudai\-runtime.md
+Per\-session runtime context (node, Slurm job, model, cwd).
+Overwritten on every launch; safe to delete.
+.TP
+.B ./.rocbudai\-sessions.json
+Project\-scoped sidecar mapping opencode session IDs to user\-given
+names (set via \fBQ1/7\fR / \fBrocbudai\-name\-session\fR).
+Read by the \fBmodule load rocbudai\fR session picker and pruned by
+\fBrocbudai\-prune\-sessions\fR. Safe to delete \(em sessions then
+fall back to opencode\(cqs auto\-generated titles in the picker.
+.TP
+.B ./report.md
+Running report the agent writes during the build\-profile\-analyse\-optimise
+loop.
+Updated incrementally; not overwritten.
+.TP
+.B ~/rocbudai\-runs/\fItimestamp\fR/
+Auto\-created project directory when \fBrocbudai\fR is launched from
+\fB$HOME\fR or an unwritable cwd. Persists after logout.
+.TP
+.B /shareddata/rocbudai/docs/inputs/
+Site knowledge base. Drop \fB.md\fR / \fB.txt\fR / \fB.html\fR / 
+\fB.pdf\fR files here for the agent to read at the next session.
+See \fBKNOWLEDGE BASE\fR above.
+.TP
+.B /shared/apps/ubuntu/opt/rocbudai/
+Installation root (\fBbin/\fR, \fBshare/\fR, \fBlibexec/\fR).
+.SH EXIT STATUS
+.TP
+.B 0
+TUI exited cleanly.
+.TP
+.B 1
+Environment problem (no Slurm allocation, no controlling TTY,
+opencode binary missing or unreadable, ollama daemon unreachable,
+model not available, etc.).
+.TP
+.B 2
+Bad usage.
+.SH EXAMPLES
+.SS Basic interactive session
+.RS 4
+.nf
+\fBsalloc \-p PPAC_MI300A_SPX \-\-exclusive \-\-comment=ollama\fR
+\fBcd ~/my-app\fR
+\fBmodule load rocbudai\fR
+.fi
+.RE
+.SS Resuming a session
+.RS 4
+.nf
+\fBcd ~/my-app\fR
+\fBrocbudai \-\-continue\fR
+.fi
+.RE
+.SS Auto\-run mode
+.RS 4
+.nf
+\fBexport ROCBUDAI_AUTORUN=1\fR
+\fBmodule load rocbudai\fR
+.fi
+.RE
+.SS Verify the airgap is in force
+.RS 4
+.nf
+\fBsalloc \-p PPAC_MI300A_SPX \-\-exclusive \-\-comment=ollama \-t 2:00:00\fR
+\fBmodule load rocbudai\fR
+\fI# in another terminal, ssh to the same allocation and run:\fR
+\fBrocbudai\-airgap\-check\fR
+.fi
+.RE
+.SH TERMINAL TIPS
+The OpenCode TUI captures the alternate screen and the mouse, which
+defeats some terminal-native conveniences (right-click copy, mouse
+scroll wheel, native scrollback) you may be used to.
+The workarounds below are useful in any terminal but are especially
+needed for WSL / Windows Terminal users, where the limitations show
+up first.
+.SS Paste-friendly output via a second shell
+The single most useful workaround \(em \fBdo this first if anything
+else here looks fiddly\fR.
+The agent writes everything important
+(commands, FACT/INFERENCE/OPINION-tagged measurements, profile paths,
+file modifications) to \fB./report.md\fR in your project directory
+as it works.
+Open a second terminal, ssh to the same compute node, and tail the
+report:
+.PP
+.RS 4
+.nf
+\fI# from another local shell or another VS Code / WSL pane\fR
+\fBssh \fIyour-compute-node\fR
+\fBcd \fIyour-project-dir\fR
+\fBtail \-f \./report.md\fR
+.fi
+.RE
+.PP
+That window is plain terminal output \(em scrolls natively, copies
+natively, no TUI capture.
+You read it for paste-friendly numbers and commands; you talk to the
+agent in the TUI window.
+This works the same on WSL, macOS, native Linux, and any SSH client.
+.SS Scrolling inside the TUI
+OpenCode supports keyboard-based scrolling inside its message
+viewport.
+The default keys (verify against your version's
+\fBopencode \-\-help\fR or \fB?\fR inside the TUI \(em they have
+shifted across releases) are typically Page-Up / Page-Down for
+page-level scroll and Ctrl\-U / Ctrl\-D (or
+\fB[\fR / \fB]\fR) for half-page scroll.
+The mouse wheel may also work depending on your terminal's mouse
+forwarding.
+Slash commands (typed in the prompt) include \fB/help\fR to list
+keybindings for the running version.
+.SS Folding the model's "Thinking" panel
+qwen3.5:122b emits an internal "thinking" channel that opencode
+renders inline.
+It is useful when debugging the agent's reasoning but can dominate
+the screen during routine work.
+Inside the TUI, \fB/thinking\fR toggles whether the thinking panel
+is shown for the current session (re-run the slash command to flip
+back).
+.SS Copy/paste in WSL / Windows Terminal
+OpenCode captures the mouse, so a normal click-drag-to-select inside
+the TUI is intercepted by opencode and does not enter Windows
+Terminal's clipboard.
+Two workarounds:
+.IP \(bu 2
+.B Hold Shift while click-dragging.
+Most terminals (including Windows Terminal, GNOME Terminal,
+Konsole, iTerm2, kitty, alacritty) treat Shift\-click as
+"bypass the application's mouse capture and select natively."
+After selecting, your terminal's normal copy gesture
+(Windows Terminal: right-click or Ctrl\-Shift\-C) puts the text on
+the clipboard.
+.IP \(bu 2
+.B Use the second-shell + \fBtail \-f report.md\fR pattern above.
+Anything you would have wanted to copy out of the TUI is already in
+the report file in copy-friendly form.
+.PP
+For the most polished experience under WSL, run the second-shell
+\fBtail \-f\fR in a separate Windows Terminal tab \(em the TUI tab
+stays for conversation, the tail tab stays for paste-able output.
+.SH MEASUREMENT NOTES
+The \fBqwen3.5:122b\fR model that powers rocBudAI is loaded into MI300A
+VRAM persistently (\fBOLLAMA_KEEP_ALIVE=\-1\fR).
+On the MI300A SPX nodes the ollama daemon is confined to APUs 0,1,2
+(\fBROCR_VISIBLE_DEVICES=0,1,2\fR plus a CPU cpuset in the ollama unit),
+which leaves \fBAPU 3 reserved exclusively for benchmarking\fR.
+.PP
+This isolation matters because the CPU and GPU of an MI300A APU share the
+same HBM. A FOM (figure\-of\-merit) command that runs on the
+.I same
+APU the model is serving from competes for that APU's compute and memory
+bandwidth and can run 10x\(en300x slower \(em pure inference contention,
+not a property of the user's code.
+A single stress\-test rep on 2026\-05\-13 measured a 250x slowdown on a
+1.6 s baseline that completed during an active inference burst.
+Running the FOM on the dedicated, model\-free APU 3 removes that
+contention so the wall time reflects your code.
+.PP
+The single\-rep wall\-time number is therefore not a reliable signal on
+its own.
+You must combine
+.B both
+of:
+.IP \(bu 2
+\fBA per\-APU quiescence guard\fR \(em wait until \fBrocm\-smi \-u\fR shows
+the bench APU (APU 3) below ~5 % busy for several consecutive samples
+before launching the command, so each rep starts from the same baseline.
+GPUs 0\(en2 are intentionally busy serving the model and are ignored.
+.IP \(bu 2
+\fBMultiple reps with median, not mean\fR \(em at least 3 effective reps
+(the first rep is dropped as warmup), reported as the median of the
+remaining reps; declare an improvement / regression / "within noise"
+call only when |delta| > 2 x inter\-rep stddev (see
+\fBAGENTS.md\fR Rule 17 / section 5.0).
+.PP
+The
+.B rocbudai\-bench
+helper packages both into a single command:
+.PP
+.RS 4
+.nf
+\fBrocbudai\-bench [OPTIONS] \-\- <command> [args...]\fR
+.fi
+.RE
+.PP
+Defaults: 4 reps (drop rep 1, take median of the remaining 3), 30 s
+quiescence timeout, 5 % bench\-APU busy threshold, 3 consecutive 1 Hz
+quiet samples.
+On timeout it prints a WARN line and proceeds.
+.PP
+Every rep is pinned to the dedicated APU: its GPU is selected via
+\fBROCR_VISIBLE_DEVICES\fR and the process is bound to that APU's CPU
+cores via \fBtaskset\fR, so USM arrays first\-touch into the APU's local
+HBM (a single APU is one NUMA region, so there is no \fBnumactl\fR).
+The bench APU and its core list are overridable with
+\fBROCBUDAI_BENCH_GPU\fR (default 3) and \fBROCBUDAI_BENCH_CPUS\fR
+(default 72\-95,168\-191) \(em point these at whichever APU is excluded
+from the ollama/agent cpuset if the topology changes.
+\fBHSA_XNACK\fR is not forced; \fBexport HSA_XNACK=1\fR yourself if your
+code needs managed\-memory page migration.
+For MPI FOMs the \fBtaskset\fR sets the APU cpuset and intra\-node rank
+binding stays your job (e.g. \fBmpirun \-\-bind\-to core\fR).
+On any rep failure it suppresses the summary, prints the last 20 lines
+of the failing rep's combined output to stderr, and exits 1.
+A single\-rep mode (\fB\-n 1\fR) is available for sanity checks; the
+output is tagged \fB[NOT\-FOM]\fR and must not be cited as
+\fB[FACT]\fR.
+.PP
+Examples:
+.PP
+.RS 4
+.nf
+\fB# Default: 4 reps with quiescence guard, 3-rep median.\fR
+rocbudai\-bench \-\- ./my_app
+
+\fB# 6 reps for a noisy benchmark.\fR
+rocbudai\-bench \-n 6 \-\- mpirun \-np 4 ./solver
+
+\fB# Skip quiescence on a node where you fully own the GPU.\fR
+rocbudai\-bench \-\-no\-wait \-\- ./isolated_run
+
+\fB# JSON output for embedding the run as evidence in report.md.\fR
+rocbudai\-bench \-\-json \-\- ./fom > .bench.json
+.fi
+.RE
+.PP
+The agent itself is required to invoke wall\-time FOM commands through
+\fBrocbudai\-bench\fR (\fBAGENTS.md\fR Rule 17, "Bench\-helper rule"
+sub\-paragraph).
+The same helper is available to you on the command line for
+hand\-checking the agent's numbers or for running benchmarks outside
+the rocBudAI session.
+.PP
+For the in\-script reference (rationale, exit codes, defaults), run:
+.PP
+.RS 4
+.nf
+\fBhead \-110 $(command \-v rocbudai\-bench)\fR
+.fi
+.RE
+.SH DIAGNOSTICS
+For a comprehensive preflight (modules, mounts, daemon reachability,
+GPU visibility, KFD leak scan, etc.):
+.PP
+.RS 4
+.nf
+\fBrocbudai\-doctor\fR
+.fi
+.RE
+.PP
+To verify the airgap baseline (managed opencode config, ollama egress
+block, daemon hardening) is in force on the current allocation:
+.PP
+.RS 4
+.nf
+\fBrocbudai\-airgap\-check\fR             \fI# user\-visible probes (no sudo)\fR
+\fBrocbudai\-airgap\-check \-\-deep\fR      \fI# also inspect nft table contents (sudo)\fR
+.fi
+.RE
+.SS Recovering from a leaked GPU profile (rocbudai-reap-stale)
+When a profile run aborts with \fBHSA_STATUS_ERROR_*\fR (any HSA
+error code, especially \fBHSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION\fR),
+when \fBrocprofv3\fR logs \fBcaught signal 15\fR or
+\fBwill wait for N children to exit\fR, or when a back-to-back retry
+fails because "the GPU still looks busy", the on-GPU child of the
+crashed run is often still alive in \fBR\fR/\fBRl\fR state holding a
+KFD context.
+The agent's bash tool returns control immediately, but the leak
+persists invisibly in the kernel and pins resources for the next
+attempt.
+\fBrocbudai\-reap\-stale\fR finds and (optionally) kills these leaked
+processes.
+.PP
+The agent invokes it automatically as part of its profile-recovery
+procedure (see \fBAGENTS.md\fR section 5.1).
+You can also run it yourself from the compute-node shell at any time:
+.PP
+.RS 4
+.nf
+\fBrocbudai\-reap\-stale\fR              \fI# dry\-run: list leaked KFD children, exit 2 if any\fR
+\fBrocbudai\-reap\-stale \-\-reap\fR        \fI# kill them (SIGTERM, then SIGKILL after 10\~s)\fR
+\fBrocbudai\-reap\-stale \-\-reap \-\-yes\fR  \fI# same, no interactive y/N prompt\fR
+\fBrocbudai\-reap\-stale \-\-help\fR        \fI# all options\fR
+.fi
+.RE
+.PP
+.B What it considers a leak.
+Any process that
+.RS 4
+.IP \(bu 2
+appears in \fB/sys/class/kfd/kfd/proc/\fR (the kernel's authoritative
+list of processes holding a KFD context),
+.IP \(bu 2
+belongs to the current \fB$USER\fR (it never touches other users'
+processes),
+.IP \(bu 2
+has been alive at least 5 minutes (configurable via
+\fB\-\-age\-min\fR; tunes out short-lived nominal children),
+.IP \(bu 2
+is not in the built-in allow-list (see below).
+.RE
+.PP
+.B What it will never kill.
+The allow-list permanently excludes \fBollama\fR / \fBollama\-real\fR
+/ \fBollama\-proxy\fR (the local model server), \fBopencode\fR (the
+TUI you are reading this in), \fBpython\fR / \fBpython3\fR (broad —
+notebooks, ML scripts, sidecar daemons), \fBjupyter\fR, and the
+XFCE/VNC desktop helpers.
+The reaper also walks its own ancestor process tree and refuses to
+touch any of its own ancestors, so it can never kill the shell that
+spawned it.
+.PP
+.B Exit codes.
+\fB0\fR no leaks (or all reaped successfully),
+\fB1\fR reap failed (one or more PIDs survived SIGKILL — almost
+always means kernel D-state, in which case
+\fBscancel $SLURM_JOB_ID\fR followed by re-allocating is the only fix),
+\fB2\fR leaks found in dry-run (the agent uses this as the signal to
+ask you whether to \fB\-\-reap\fR), \fB3\fR bad usage / environment
+problem.
+.PP
+Common failure modes and fixes:
+.IP \(bu 2
+\fIno SLURM_JOB_ID\fR \(em you are on a login node; allocate a
+compute node first with
+\fBsalloc \-p PPAC_MI300A_SPX \-\-exclusive \-\-comment=ollama \-\-time=02:00:00\fR
+and re\-run \fBmodule load rocbudai\fR there.
+.IP \(bu 2
+\fIno controlling TTY\fR \(em the launcher needs an interactive shell;
+do not pipe or background it.
+.IP \(bu 2
+\fIollama daemon not reachable\fR \(em re\-allocate with
+\fB\-\-comment=ollama\fR; check \fBsystemctl is\-active ollama
+ollama\-proxy\fR on the compute node.
+.IP \(bu 2
+\fImodel '...' not in registry\fR \(em ask an admin to
+\fBollama pull\fR the model.
+.IP \(bu 2
+\fImodule spider openmpi (or hipfort, pytorch, ...) returns 'no
+module(s) found'\fR \(em the cluster's Lmod is hierarchical; you
+must load \fBrocm/<ver>\fR first to expose ROCm-tier libraries.
+The agent does this automatically as part of its build setup; this
+only matters when running \fBmodule\fR commands by hand. Recover with:
+\fBmodule load rocm/<ver> && module spider openmpi\fR (or
+\fBmodule load rocm/<ver> && module avail 2>&1 | grep \-i openmpi\fR).
+.IP \(bu 2
+\fB$ROCM_PATH (or another module-set variable) reads empty\fR when you
+\fBecho\fR it \(em each command runs in its own shell, so a
+\fBmodule load\fR done in a previous, separate call is already gone.
+This is NOT a stale shell that needs \fBsource\fR-ing. Re-run with the
+load chained: \fBmodule load rocm/<ver> && echo $ROCM_PATH\fR (or
+\fB&& \fRthe command that needs it).
+.SH SEE ALSO
+.BR rocprofv3 (1),
+.BR rocprof-compute (1),
+.BR rocprof-sys (1),
+.BR rocm-smi (1)
+.SH COPYRIGHT
+Copyright (c) 2026 AMD.
+Distributed under the MIT License; see the \fBLICENSE\fR file in the
+rocBudAI source tree.

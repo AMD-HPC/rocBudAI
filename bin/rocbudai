@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai — compute-node entry point that forwards to rocbudai-tui.
+#
+# This is a thin wrapper for fresh-session / resume / picker-bypass on the
+# compute node. It is NOT a login-node salloc shortcut: from a login node
+# you must allocate a compute node yourself with `salloc` (the wrapper
+# refuses to run otherwise).
+#
+# Usage (on the compute node, post-allocation):
+#   rocbudai                          # fresh session (or picker if prior sessions exist)
+#   rocbudai --continue|-c            # resume the last session in this dir
+#   rocbudai --new|-n                 # force a fresh session (skip the picker)
+#   rocbudai -h | --help              # this help
+#
+# To allocate a compute node from a login node:
+#   salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama --time=01:00:00
+# Then on the compute node prompt:
+#   cd <project-dir> && module load rocbudai
+#
+# See: man rocbudai
+
+set -euo pipefail
+
+usage() {
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    cat >&2 <<'EOF'
+[rocbudai] error: rocbudai must run on a Slurm-allocated compute node
+[rocbudai]        (no SLURM_JOB_ID in this shell — you are on a login node).
+[rocbudai]
+[rocbudai] allocate one first (-p selects the SPX MI300A partition;
+[rocbudai] --comment=ollama starts the ollama daemon for you):
+[rocbudai]   salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama --time=01:00:00
+[rocbudai]
+[rocbudai] then on the compute node prompt:
+[rocbudai]   cd <project-dir> && module load rocbudai
+[rocbudai]
+[rocbudai] see: man rocbudai
+EOF
+    exit 1
+fi
+
+exec rocbudai-tui "$@"

@@ -1,0 +1,17 @@
+[Unit]
+Description=Ollama egress firewall (rocBudAI Phase 5: block ollama UID outbound to non-cluster)
+Documentation=https://shareddata/rocbudai/docs/airgap-and-model-pulls.md
+After=network-pre.target nftables.service
+Wants=network-pre.target
+ConditionPathExists=/etc/nftables.d/ollama-egress.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/ollama-egress.nft
+ExecStop=/usr/sbin/nft delete table inet ollama_egress
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

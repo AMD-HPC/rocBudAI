@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama/qwen3.5:122b",
+  "share": "disabled",
+  "instructions": ["AGENTS.md"],
+  "permission": {
+    "edit": "allow",
+    "webfetch": "allow",
+    "bash": {
+      "*": "allow",
+
+      "module purge": "deny",
+      "module purge *": "deny",
+      "module reset": "deny",
+      "module reset *": "deny",
+
+      "*…*": "deny",
+      "*&-&*": "deny",
+      "*...": "deny",
+
+      "rm -rf /": "deny",
+      "rm -rf /*": "deny",
+      "rm -rf ~": "deny",
+      "rm -rf ~/*": "deny",
+      "rm -rf $HOME": "deny",
+      "rm -rf $HOME/*": "deny",
+      "rm -rf /shared*": "deny",
+      "rm -rf /etc*": "deny",
+      "rm -rf /usr*": "deny",
+      "rm -rf /opt*": "deny",
+      "rm -rf /var*": "deny",
+
+      "sudo *": "ask",
+      "dd *": "ask",
+      "mkfs*": "deny",
+      "shutdown*": "deny",
+      "reboot*": "deny",
+
+      "scancel *": "ask",
+      "systemctl *": "deny",
+      "service *": "deny"
+    }
+  }
+}

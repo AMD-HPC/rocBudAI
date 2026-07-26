@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-ingest-inputs — convert PDFs in the knowledge base to .md sidecars
+#                       so the text-only LLM (qwen3.5:122b) can read them.
+#
+# Usage:   rocbudai-ingest-inputs [--force] [--dir <path>]
+#
+# Defaults:
+#   --dir   $ROCBUDAI_KB_INPUTS_DIR, else /shareddata/rocbudai/docs/inputs
+#   --force re-convert even if the .md sidecar is newer than the .pdf
+#
+# Behaviour:
+#   For each foo.pdf in the input dir (and subdirs):
+#     - skip if foo.md exists and is newer than foo.pdf and --force is off
+#     - run `pdftotext -layout` to extract text preserving column structure
+#     - prepend a YAML front-matter header with source / mtime / tool / pages
+#     - if pdftotext returns 0 bytes of text, write a `.NEEDS-OCR` marker
+#       so a human knows to re-run with `ocrmypdf` (not installed by default)
+#
+# This script is air-gap-safe: it does not contact any external service.
+#
+# Convention: agents only read .md files. .pdf is archival.
+
+set -euo pipefail
+
+DIR="${ROCBUDAI_KB_INPUTS_DIR:-/shareddata/rocbudai/docs/inputs}"
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dir)   DIR="$2"; shift 2;;
+        --force) FORCE=1; shift;;
+        -h|--help)
+            sed -n '2,20p' "$0"; exit 0;;
+        *) echo "unknown arg: $1" >&2; exit 2;;
+    esac
+done
+
+if [[ ! -d "$DIR" ]]; then
+    echo "no such dir: $DIR" >&2; exit 1
+fi
+
+command -v pdftotext >/dev/null 2>&1 || {
+    echo "pdftotext not found (apt install poppler-utils)" >&2; exit 1
+}
+
+PDFTOTEXT_VERSION="$(pdftotext -v 2>&1 | head -1 | awk '{print $3}')"
+
+shopt -s globstar nullglob
+n_converted=0
+n_skipped=0
+n_ocr_needed=0
+
+for pdf in "$DIR"/**/*.pdf; do
+    md="${pdf%.pdf}.md"
+
+    if [[ -f "$md" && $FORCE -eq 0 && "$md" -nt "$pdf" ]]; then
+        n_skipped=$((n_skipped+1))
+        continue
+    fi
+
+    pages="$(pdfinfo "$pdf" 2>/dev/null | awk -F': +' '/^Pages:/{print $2}')"
+    pdf_mtime="$(stat -c '%y' "$pdf")"
+    src_basename="$(basename "$pdf")"
+
+    tmp_txt="$(mktemp)"
+    if ! pdftotext -layout "$pdf" "$tmp_txt" 2>/dev/null; then
+        echo "WARN: pdftotext failed on $pdf" >&2
+        rm -f "$tmp_txt"
+        continue
+    fi
+
+    if [[ ! -s "$tmp_txt" ]]; then
+        # No extractable text — likely a scanned/image-only PDF.
+        marker="${pdf%.pdf}.NEEDS-OCR"
+        cat > "$marker" <<EOF
+# This PDF has no extractable text layer (likely scanned / image-only).
+# Run \`ocrmypdf\` (not installed by default) or recreate the PDF from the
+# original source. The agent will skip this file.
+#
+# Source: $src_basename ($pages pages)
+# Detected: $(date -Is)
+EOF
+        rm -f "$tmp_txt"
+        n_ocr_needed=$((n_ocr_needed+1))
+        continue
+    fi
+
+    {
+        printf -- '---\n'
+        printf 'source: %s\n' "$src_basename"
+        printf 'source_mtime: "%s"\n' "$pdf_mtime"
+        printf 'pages: %s\n' "${pages:-unknown}"
+        printf 'extracted_with: "pdftotext -layout (poppler %s)"\n' "$PDFTOTEXT_VERSION"
+        printf 'extracted_at: "%s"\n' "$(date -Is)"
+        printf -- '---\n\n'
+        cat "$tmp_txt"
+    } > "$md"
+
+    chmod 0664 "$md" 2>/dev/null || true
+    rm -f "$tmp_txt"
+    n_converted=$((n_converted+1))
+    echo "OK  $pdf  ->  $md  ($pages pages)"
+done
+
+echo ""
+echo "summary: converted=$n_converted skipped=$n_skipped needs-ocr=$n_ocr_needed"

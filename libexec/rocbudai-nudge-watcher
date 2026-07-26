@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+"""rocBudAI auto-nudge watcher (out-of-process sidecar).
+
+Watches the opencode HTTP/SSE event stream of the locally-launched
+opencode TUI; when a session has been idle (assistant turn ended,
+no new user message) for ROCBUDAI_NUDGE_AFTER_S seconds (default 240),
+injects a brief "continue" prompt so the model picks up where it
+left off. The nudge is a normal user message (opencode has no hidden
+channel) so it appears verbatim in the transcript.
+
+The nudge fires AT MOST ONCE per user message (gated by
+nudged_for == last_user_msg_id), so an AFK user will see one
+unprompted "continue" + response, not a runaway cascade.
+
+This file is intentionally tiny + stdlib-only:
+  - the opencode server it talks to is on 127.0.0.1; the kernel-level
+    airgap (rocbudai-user-egress.service) plus the auth model
+    (same-uid localhost = trusted) means we need no auth header.
+  - opencode's port is provisioned by bin/rocbudai-tui (free
+    ephemeral port via socket bind, passed via --port AND env to us);
+    no port discovery loop needed.
+
+Design history: an in-process opencode PLUGIN was tried first and
+hit two design bugs (noReply: true never actually triggered the
+model; a "no assistant text" heuristic mis-fired on tool-only turns).
+This sidecar replaced it. The sidecar in turn started with a
+structural lazy-detection heuristic (look at last assistant msg
+parts; nudge only if no text content) which false-NEGATIVED on
+"promissory header" turns (e.g. the model emits "Report so far:
+/path/to/x.md" then stops, which has text content but is
+functionally abandoned). We dropped the heuristic and now nudge
+purely on idle timeout — simpler, no false negatives. The
+nudged_for=last_user_msg_id gate keeps the false-positive blast
+radius bounded to one nudge per user turn.
+
+Disable per-session: export ROCBUDAI_NUDGE_DISABLE=1 before
+`module load rocbudai`.
+
+Env contract (all set by bin/rocbudai-tui before backgrounding us):
+  ROCBUDAI_OPENCODE_PORT       (required) opencode HTTP port
+  ROCBUDAI_WATCHER_PARENT_PID  (required) rocbudai-tui's PID; we exit
+                               when that process dies
+  ROCBUDAI_NUDGE_AFTER_S       (optional, default 240) idle seconds
+                               before we nudge
+  ROCBUDAI_NUDGE_TEXT          (optional) override the nudge content
+  ROCBUDAI_NUDGE_DISABLE       (optional) "1" to no-op
+  ROCBUDAI_NUDGE_LOG           (optional) path to append diagnostics
+                               to; default: silent.
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+import urllib.request
+
+PORT = int(os.environ.get("ROCBUDAI_OPENCODE_PORT", "0"))
+PARENT_PID = int(os.environ.get("ROCBUDAI_WATCHER_PARENT_PID", os.getppid()))
+NUDGE_AFTER_S = float(os.environ.get("ROCBUDAI_NUDGE_AFTER_S", "240"))
+NUDGE_COOLDOWN_S = 30.0
+NUDGE_TEXT = os.environ.get("ROCBUDAI_NUDGE_TEXT", "continue")
+LOG_PATH = os.environ.get("ROCBUDAI_NUDGE_LOG", "")
+
+# Per-session state: { sessionID: {last_user_msg_id, last_idle_t, nudged_for, cooldown_until} }
+STATE = {}
+STATE_LOCK = threading.Lock()
+
+
+def log(msg):
+    if not LOG_PATH:
+        return
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
+def parent_alive():
+    if PARENT_PID <= 1:
+        return False
+    try:
+        os.kill(PARENT_PID, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def http_json(method, path, body=None, timeout=5):
+    url = f"http://127.0.0.1:{PORT}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+def post_nudge(sid):
+    try:
+        http_json(
+            "POST",
+            f"/session/{sid}/prompt_async",
+            body={"parts": [{"type": "text", "text": NUDGE_TEXT}]},
+        )
+        log(f"nudged {sid}")
+        return True
+    except Exception as e:
+        log(f"nudge {sid}: POST failed {e!r}")
+        return False
+
+
+def maybe_nudge(sid):
+    """Called NUDGE_AFTER_S after a session.idle. If no newer idle has
+    arrived since (would mean the session woke up on its own) and we
+    haven't already nudged for the current user message, fire."""
+    time.sleep(NUDGE_AFTER_S)
+    if not parent_alive():
+        return
+    with STATE_LOCK:
+        st = STATE.get(sid)
+        if not st:
+            return
+        # if a newer session.idle arrived after this maybe_nudge() was
+        # scheduled, the newer one's timer wins — bail to avoid
+        # firing a stale nudge on top of fresh activity.
+        if time.time() - st.get("last_idle_t", 0) < NUDGE_AFTER_S - 1.0:
+            return
+        if time.time() < st.get("cooldown_until", 0):
+            return
+        mid = st.get("last_user_msg_id")
+        if not mid or st.get("nudged_for") == mid:
+            return
+        st["nudged_for"] = mid
+        st["cooldown_until"] = time.time() + NUDGE_COOLDOWN_S
+    post_nudge(sid)
+
+
+def parent_watch_loop():
+    while True:
+        if not parent_alive():
+            os._exit(0)
+        time.sleep(2)
+
+
+def event_loop():
+    """Subscribe to the SSE stream, update STATE, schedule nudges."""
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{PORT}/", timeout=1
+            ).read(64)
+            break
+        except Exception:
+            if not parent_alive():
+                return
+            time.sleep(1)
+    else:
+        log("opencode never came up within 60 s")
+        return
+    log(f"connected; opencode on :{PORT}, parent={PARENT_PID}")
+
+    while parent_alive():
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{PORT}/event",
+                headers={"Accept": "text/event-stream"},
+            )
+            r = urllib.request.urlopen(req, timeout=None)
+            for raw in r:
+                if not parent_alive():
+                    return
+                if not raw.startswith(b"data: "):
+                    continue
+                try:
+                    evt = json.loads(raw[6:].strip())
+                except Exception:
+                    continue
+                t = evt.get("type", "")
+                p = evt.get("properties") or {}
+                sid = p.get("sessionID")
+                if not sid:
+                    continue
+                if t == "message.updated":
+                    info = p.get("info") or {}
+                    if info.get("role") == "user":
+                        with STATE_LOCK:
+                            st = STATE.setdefault(sid, {})
+                            mid = info.get("id")
+                            if mid and mid != st.get("last_user_msg_id"):
+                                st["last_user_msg_id"] = mid
+                                st["nudged_for"] = None
+                elif t == "session.idle":
+                    with STATE_LOCK:
+                        st = STATE.setdefault(sid, {})
+                        st["last_idle_t"] = time.time()
+                    threading.Thread(
+                        target=maybe_nudge, args=(sid,), daemon=True
+                    ).start()
+                elif t == "session.deleted":
+                    with STATE_LOCK:
+                        STATE.pop(sid, None)
+        except Exception as e:
+            log(f"event loop reconnect: {e!r}")
+            if not parent_alive():
+                return
+            time.sleep(3)
+
+
+def main():
+    if os.environ.get("ROCBUDAI_NUDGE_DISABLE") == "1":
+        return
+    if not PORT:
+        sys.stderr.write(
+            "rocbudai-nudge-watcher: ROCBUDAI_OPENCODE_PORT unset; nothing to do\n"
+        )
+        return
+    threading.Thread(target=parent_watch_loop, daemon=True).start()
+    try:
+        event_loop()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

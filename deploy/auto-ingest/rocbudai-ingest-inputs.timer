@@ -1,0 +1,16 @@
+[Unit]
+Description=rocBudAI — periodic KB ingest fallback
+Documentation=man:rocbudai(1)
+# Belt-and-suspenders for the .path unit: catches the edge case where
+# a PDF was added via a non-login-node NFS mount (inotify on the login
+# node never fires for those). 1-hour cadence is a compromise between
+# "users notice in-session lag" and "needless NFS scans".
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=rocbudai-ingest-inputs.service
+
+[Install]
+WantedBy=timers.target

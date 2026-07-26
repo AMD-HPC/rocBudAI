@@ -1,0 +1,94 @@
+[Unit]
+Description=Ollama Service (rocBudAI)
+Documentation=file:///shared/apps/ubuntu/opt/rocbudai/README.md
+After=network-online.target remote-fs.target
+Wants=network-online.target
+RequiresMountsFor=/shareddata
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+SupplementaryGroups=render video
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=3
+
+# Daemon-only env. Must NOT be set in /etc/profile.d/ — leaks to user shells.
+Environment="OLLAMA_MODELS=/shareddata/Ollama_Models"
+Environment="OLLAMA_HOST=127.0.0.1:11435"
+# NOTE: HSA_XNACK is deliberately NOT set. ollama's HIP backend (ggml)
+# uses explicit hipMalloc device allocations, not managed-memory /
+# demand-paging, so XNACK gives the daemon nothing on MI300A OR discrete
+# GPUs. Forcing it on discrete parts (MI300X/MI355X) also perturbs
+# rocprofv3. XNACK is a per-workload choice: users who need it for their
+# own kernels export HSA_XNACK=1 in their shell (see `man rocbudai`).
+# MI300A is an APU: every gfx942 die enumerates as an *integrated* GPU. Newer
+# ollama (>=0.30, seen 0.30.11) drops integrated GPUs by default — it logs
+# "dropping integrated GPU; to enable, set OLLAMA_IGPU_ENABLE=1", reports
+# total_vram=0, and falls back to 100% CPU (brutally slow warm-up; a small
+# model's first turn can be slow enough to return empty and look like the
+# persona "didn't load"). Setting this re-enables the APUs: they then register
+# as library=ROCm gfx942 with full HBM and the model runs 100% GPU. Verified
+# on an MI300A node inside the ROCm dev container: without it the demo models
+# ran on CPU; with it they load 100% GPU. Harmless on older ollama (unknown
+# env vars are ignored).
+Environment="OLLAMA_IGPU_ENABLE=1"
+# Dedicated-bench-GPU isolation. The GPU/CPU split (ROCR_VISIBLE_DEVICES +
+# AllowedCPUs) is supplied at install time by the drop-in
+# /etc/systemd/system/ollama.service.d/10-gpu-split.conf (see
+# install.sh:configure_gpu_split). It reserves the last GPU for
+# rocbudai-bench and is omitted entirely in container/no-systemd mode so
+# the LLM and bench share all GPUs.
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+Environment="OLLAMA_SCHED_SPREAD=1"
+# Phase 8.1 (2026-05-13): KEEP_ALIVE=-1 was 4h. With the canonical model
+# kept resident (see MAX_LOADED_MODELS below — Phase 9 lowered this to 1),
+# the 4h eviction timer was the only remaining cold-load source
+# inside a Slurm job — typically hit during overnight "let me think"
+# pauses, lunch breaks, or all-day pair-programming sessions. The
+# Slurm epilog drop-in (rocbudai-ollama-epilog.sh) still stops the daemon
+# at job end, so -1 only pins models within an active rocbudai job.
+# See also Phase-8.1 LOAD_TIMEOUT + GPU_OVERHEAD additions below.
+Environment="OLLAMA_KEEP_ALIVE=-1"
+# Phase 5 (2026-05-12): tune concurrency for HBM-resident operation. A
+# rocbudai session is one user, one prompt at a time; NUM_PARALLEL>1 just
+# shards KV cache across slots without any throughput win and steals HBM.
+# Capping at 1 gives the active model the full slot.
+#
+# Phase 9 (2026-06-05): MAX_LOADED_MODELS lowered 2 -> 1 for the
+# dedicated-bench-APU layout. With the daemon now confined to 3 APUs
+# (ROCR_VISIBLE_DEVICES=0,1,2 above) we keep exactly ONE model resident so
+# a single ~80-90 GiB model + q8 KV cache + GPU_OVERHEAD fits comfortably
+# in 3x128 GiB with headroom, rather than packing two models onto three
+# dies. The prolog only pre-warms the canonical default model
+# (qwen3.5:122b) anyway; the trade-off is that switching to an opt-in
+# model (ROCBUDAI_MODEL=gpt-oss:120b or nemotron-3-super:120b) is now a
+# cold-load instead of an instant swap. Raise back toward 2 only if the
+# bench APU is given back to ollama.
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_NOPRUNE=1"
+Environment="OLLAMA_NO_CLOUD=1"
+
+# Phase 8.1 (2026-05-13): Tier-B safety nets from internal ollama-tuning
+# benchmarking on the reference cluster.
+# Both knobs are pure safety nets — never trigger in steady state,
+# only during cold-start / accountant-edge cases.
+#   LOAD_TIMEOUT=15m: bench measured a fresh-node first cold qwen
+#     load near the 5-min default; 15m absorbs transient I/O slowness
+#     on /var/local/cache/ollama (NVMe filling cache during a
+#     parallel rocbudai-model-cache.service rsync, etc.).
+#   GPU_OVERHEAD=4294967296 (4 GiB per die): reserves HIP scratch +
+#     rocBLAS workspace + MIOpen find-mode-cache headroom so ollama's
+#     memory accountant doesn't spill a layer when a real workload
+#     starts allocating. 4 GiB × 4 dies = 16 GiB out of 549 GiB
+#     total (~3 %). Negligible vs the ~172 GiB resident set today.
+# See rocbudai_project audit 2026-05-13-phase8.1-ollama-tier-b-safety-nets.md
+# for the full FACT/INFERENCE/OPINION rationale + bench evidence.
+Environment="OLLAMA_LOAD_TIMEOUT=15m"
+Environment="OLLAMA_GPU_OVERHEAD=4294967296"
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-reap-stale — find and (optionally) kill leaked KFD-bound
+# processes left behind by failed rocprofv3 / mpirun / HIP runs.
+#
+# Background: when an HSA error fires (e.g.
+# HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION 0x29) the runtime aborts
+# but the on-GPU thread can stay in `R`/`Rl` state in some kernel /
+# MPI cleanup loop. rocprofv3's signal handler then logs
+# "rocprofv3 will wait for 1 children to exit" and waits forever.
+# The agent's `bash` tool eventually returns control, but the leaked
+# child stays alive — pinning a KFD context, holding VRAM, and
+# blocking the next clean attempt.
+#
+# This tool finds those leaks and reaps them.
+#
+# Invocation:
+#   1. By the agent, after any non-zero rocprofv3/mpirun/HIP exit:
+#          rocbudai-reap-stale            # dry-run, exit 2 if leaks
+#          rocbudai-reap-stale --reap     # kill TERM, wait, then KILL
+#   2. By the user from the compute-node shell.
+#   3. By rocbudai-doctor (check #9, dry-run only).
+#
+# Data source:
+#   - /sys/class/kfd/kfd/proc/<pid>  (authoritative kernel list of
+#     processes with a KFD context). No sudo, no rocm-smi needed.
+#   - Cross-referenced with `ps` to filter by current user, age,
+#     and command name (allow-list).
+#
+# Exit codes:
+#   0 — no leaks found (dry-run), or all reaped successfully (--reap).
+#   1 — reap failed (one or more PIDs survived SIGKILL).
+#   2 — leaks found in dry-run (the agent should propose --reap).
+#   3 — bad usage / environment problem.
+
+set -uo pipefail
+
+# Defaults --------------------------------------------------------------------
+AGE_MIN_DEFAULT=5
+# Allow-list of process `comm` names (16-char kernel-truncated form,
+# matches /proc/<pid>/comm). Anything in this regex is NOT a leak —
+# they are legitimate long-lived KFD users for the session.
+EXCLUDE_DEFAULT='^(ollama-real|ollama-proxy|opencode|ollama|python3?|sd-pam|systemd|Xvnc|xfwm4|xfce4-?.*|xfsettingsd|xiccd|xfdesktop|gvfsd.*|pipewire.*|jupyter.*)$'
+KFD_PROC_DIR=/sys/class/kfd/kfd/proc
+
+# Globals
+AGE_MIN=$AGE_MIN_DEFAULT
+EXCLUDE_RE="$EXCLUDE_DEFAULT"
+DO_REAP=0
+ASSUME_YES=0
+QUIET=0
+
+# Colour helpers --------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_OK=$'\e[32m'; C_FAIL=$'\e[31m'; C_WARN=$'\e[33m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
+else
+    C_OK=""; C_FAIL=""; C_WARN=""; C_DIM=""; C_RST=""
+fi
+
+usage() {
+    cat <<EOF
+rocbudai-reap-stale — find / kill leaked KFD-bound child processes
+
+USAGE:
+    rocbudai-reap-stale [options]
+
+OPTIONS:
+    -h, --help          show this help
+    -q, --quiet         suppress headers and per-PID descriptions
+        --reap          actually kill the leaks (default: dry-run)
+    -y, --yes           skip the y/Enter confirmation before killing
+        --age-min N     only consider processes older than N minutes
+                        (default: ${AGE_MIN_DEFAULT}; set 0 to consider all)
+        --exclude RE    extra POSIX-extended regex over /proc/<pid>/comm
+                        to spare additional processes; merged with the
+                        built-in allow-list (ollama, opencode, python,
+                        XFCE/VNC desktop, …)
+
+EXIT CODES:
+    0   no leaks found, or all reaped
+    1   reap failed (PIDs survived SIGKILL)
+    2   leaks found in dry-run (agent should call --reap)
+    3   bad usage / environment problem
+
+DATA SOURCE:
+    /sys/class/kfd/kfd/proc/<pid> is the kernel's authoritative list of
+    processes currently holding a KFD context. We cross-reference with
+    ps -u \$USER to filter to the current user, then exclude the
+    allow-list comms above.
+EOF
+}
+
+# CLI parsing -----------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)      usage; exit 0 ;;
+        -q|--quiet)     QUIET=1; shift ;;
+        --reap)         DO_REAP=1; shift ;;
+        -y|--yes)       ASSUME_YES=1; shift ;;
+        --age-min)      AGE_MIN="${2:-}"; shift 2 ;;
+        --exclude)      EXCLUDE_RE="${EXCLUDE_RE%$}|${2}"; shift 2 ;;
+        *)              echo "unknown option: $1" >&2; usage >&2; exit 3 ;;
+    esac
+done
+
+# Helpers ---------------------------------------------------------------------
+err()  { printf '%s[reap-stale]%s %s\n' "$C_FAIL" "$C_RST" "$*" >&2; }
+warn() { printf '%s[reap-stale]%s %s\n' "$C_WARN" "$C_RST" "$*" >&2; }
+# info() prints decorative output (headers, hints). Suppressed under
+# --quiet. The leak summary line and the per-PID table are emitted
+# separately with `summary()` / `table()` so --quiet still yields a
+# parseable "N leaked …" line plus tab-separated rows on stdout.
+info()    { [[ $QUIET -eq 1 ]] || printf '%s\n' "$*"; }
+summary() { printf '%s\n' "$*"; }
+row()     { printf '%s\n' "$*"; }
+
+# Convert ps etime (D-HH:MM:SS / HH:MM:SS / MM:SS) to total minutes (int).
+etime_to_min() {
+    local etime="$1" days=0 hours=0 mins=0 secs=0
+    if [[ "$etime" == *-* ]]; then
+        days="${etime%%-*}"; etime="${etime#*-}"
+    fi
+    case "${etime//[^:]/}" in
+        ::) IFS=: read -r hours mins secs <<<"$etime" ;;
+        :)  IFS=: read -r mins secs <<<"$etime" ;;
+        "") secs="$etime" ;;
+    esac
+    echo $(( days*1440 + 10#${hours:-0}*60 + 10#${mins:-0} + (10#${secs:-0} >= 30 ? 1 : 0) ))
+}
+
+# Sanity: KFD sysfs available? -----------------------------------------------
+if [[ ! -d "$KFD_PROC_DIR" ]]; then
+    err "$KFD_PROC_DIR not present — is amdkfd loaded? (rocBudAI requires AMD GPUs.)"
+    exit 3
+fi
+
+# Self / ancestor PIDs to never touch (don't kill our own shell or
+# the opencode TUI we're running under).
+SELF_PID=$$
+SELF_TREE=()
+_p=$SELF_PID
+while [[ -n "$_p" && "$_p" -gt 1 ]]; do
+    SELF_TREE+=("$_p")
+    _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)
+done
+in_self_tree() {
+    local pid="$1" t
+    for t in "${SELF_TREE[@]}"; do [[ "$pid" == "$t" ]] && return 0; done
+    return 1
+}
+
+# Enumerate KFD processes for the current user --------------------------------
+# Build an associative array of candidate PIDs with their metadata.
+declare -a CAND_PID=() CAND_PPID=() CAND_COMM=() CAND_ETIME=() CAND_STAT=() CAND_AGE_MIN=()
+
+for pid_dir in "$KFD_PROC_DIR"/[0-9]*; do
+    pid="${pid_dir##*/}"
+    [[ -d "$pid_dir" ]] || continue
+
+    # Read process metadata via a single ps call (PID could vanish between
+    # iterations; ignore if so).
+    line=$(ps -o user=,ppid=,etime=,stat=,comm= -p "$pid" 2>/dev/null) || continue
+    [[ -n "$line" ]] || continue
+
+    user=$(awk '{print $1}' <<<"$line")
+    ppid=$(awk '{print $2}' <<<"$line")
+    etime=$(awk '{print $3}' <<<"$line")
+    stat=$(awk '{print $4}' <<<"$line")
+    comm=$(awk '{for (i=5; i<=NF; i++) printf "%s%s", $i, (i==NF?"":" ")}' <<<"$line")
+
+    # Filter: current user only.
+    [[ "$user" == "$USER" ]] || continue
+
+    # Skip self / ancestors.
+    in_self_tree "$pid" && continue
+
+    # Skip allow-listed comms.
+    [[ "$comm" =~ $EXCLUDE_RE ]] && continue
+
+    age=$(etime_to_min "$etime")
+    [[ "$age" -lt "$AGE_MIN" ]] && continue
+
+    CAND_PID+=("$pid")
+    CAND_PPID+=("$ppid")
+    CAND_COMM+=("$comm")
+    CAND_ETIME+=("$etime")
+    CAND_STAT+=("$stat")
+    CAND_AGE_MIN+=("$age")
+done
+
+NCAND=${#CAND_PID[@]}
+
+# Header ---------------------------------------------------------------------
+if [[ $QUIET -eq 0 ]]; then
+    echo "rocbudai-reap-stale — leaked KFD process scan"
+    printf "host: %s   user: %s   age-min: %s   exclude: %s\n" \
+        "$(hostname)" "${USER:-?}" "$AGE_MIN" "$EXCLUDE_RE"
+    echo "──────────────────────────────────────────────────────────"
+fi
+
+# No leaks: short-circuit ----------------------------------------------------
+if [[ $NCAND -eq 0 ]]; then
+    if [[ $QUIET -eq 0 ]]; then
+        info "  ${C_OK}[ ok ]${C_RST}   no leaked KFD processes for ${USER}"
+    else
+        summary "0 leaked KFD process(es) for ${USER}"
+    fi
+    exit 0
+fi
+
+# List candidates ------------------------------------------------------------
+if [[ $QUIET -eq 0 ]]; then
+    info "  ${C_WARN}[warn]${C_RST}   ${NCAND} leaked KFD process(es) for ${USER}:"
+    info ""
+    info "    PID      PPID    AGE      STAT  COMMAND"
+    for i in "${!CAND_PID[@]}"; do
+        info "    $(printf '%-7s  %-6s  %-7s  %-4s  %s' \
+            "${CAND_PID[$i]}" "${CAND_PPID[$i]}" \
+            "${CAND_ETIME[$i]}" "${CAND_STAT[$i]}" "${CAND_COMM[$i]}")"
+    done
+    info ""
+else
+    summary "${NCAND} leaked KFD process(es) for ${USER}"
+    for i in "${!CAND_PID[@]}"; do
+        row "$(printf '%s\t%s\t%s\t%s\t%s' \
+            "${CAND_PID[$i]}" "${CAND_PPID[$i]}" \
+            "${CAND_ETIME[$i]}" "${CAND_STAT[$i]}" "${CAND_COMM[$i]}")"
+    done
+fi
+
+# Dry-run path ---------------------------------------------------------------
+if [[ $DO_REAP -eq 0 ]]; then
+    info "  ${C_DIM}(dry-run; pass --reap to terminate, --yes to skip prompt)${C_RST}"
+    exit 2
+fi
+
+# Reap path ------------------------------------------------------------------
+if [[ $ASSUME_YES -eq 0 ]]; then
+    if [[ ! -t 0 ]]; then
+        err "no TTY for confirmation; pass --yes to reap non-interactively"
+        exit 3
+    fi
+    printf "Reap these %d leaked GPU child(ren)? SIGTERM, then SIGKILL after 10s. ollama / opencode / python / desktop helpers are protected. [y/N] " "$NCAND"
+    read -r REPLY
+    case "$REPLY" in
+        y|Y|yes|YES) ;;
+        *) info "aborted, no PIDs killed."; exit 2 ;;
+    esac
+fi
+
+# SIGTERM first.
+info "  sending SIGTERM to ${NCAND} PIDs…"
+kill -TERM "${CAND_PID[@]}" 2>/dev/null || true
+
+# Wait up to 10s for graceful exit.
+for s in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    survivors=()
+    for pid in "${CAND_PID[@]}"; do
+        kill -0 "$pid" 2>/dev/null && survivors+=("$pid")
+    done
+    [[ ${#survivors[@]} -eq 0 ]] && break
+done
+
+if [[ ${#survivors[@]} -eq 0 ]]; then
+    info "  ${C_OK}[ ok ]${C_RST}   all ${NCAND} reaped via SIGTERM."
+    exit 0
+fi
+
+# SIGKILL the holdouts.
+info "  ${C_WARN}[warn]${C_RST}   ${#survivors[@]} survived SIGTERM; sending SIGKILL…"
+kill -KILL "${survivors[@]}" 2>/dev/null || true
+sleep 1
+final=()
+for pid in "${survivors[@]}"; do
+    kill -0 "$pid" 2>/dev/null && final+=("$pid")
+done
+if [[ ${#final[@]} -eq 0 ]]; then
+    info "  ${C_OK}[ ok ]${C_RST}   reaped (TERM + KILL)."
+    exit 0
+fi
+
+err "  ${#final[@]} PID(s) survived SIGKILL: ${final[*]}"
+err "  these are likely uninterruptible (kernel D-state); reboot or scancel may be required."
+exit 1

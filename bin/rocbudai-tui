@@ -1,0 +1,1236 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-tui — compute-node TUI launcher for rocBudAI.
+#
+# This script is what `module load rocbudai` execs once it's verified that we
+# are on an interactive compute node. It must NOT be invoked on the login
+# node directly by users (there is no ollama daemon there).
+#
+# Responsibilities:
+#   1. Sanity checks (compute node, TTY, ollama reachable).
+#   2. Pick / create a working directory.
+#   3. Ensure opencode.json and AGENTS.md are present in the CWD.
+#   4. Exec opencode with the project-pinned model.
+#
+# Exit codes:
+#   0  — TUI exited cleanly.
+#   1  — environment problem (printed to stderr).
+#   2  — bad usage.
+
+set -euo pipefail
+
+ROCBUDAI_ROOT="${ROCBUDAI_ROOT:-/shared/apps/ubuntu/opt/rocbudai}"
+ROCBUDAI_OPENCODE_DIR="${ROCBUDAI_OPENCODE_DIR:-/shared/apps/ubuntu/opt/opencode/1.14.28}"
+ROCBUDAI_OPENCODE_BIN="${ROCBUDAI_OPENCODE_BIN:-${ROCBUDAI_OPENCODE_DIR}/opencode}"
+ROCBUDAI_OLLAMA_HOST="${ROCBUDAI_OLLAMA_HOST:-http://127.0.0.1:11434}"
+ROCBUDAI_MODEL="${ROCBUDAI_MODEL:-qwen3.5:122b}"
+ROCBUDAI_ALLOWED_MODELS="${ROCBUDAI_ALLOWED_MODELS:-qwen3.5:122b}"
+ROCBUDAI_SHARE="${ROCBUDAI_ROOT}/share/rocbudai"
+# Which AGENTS.md persona template to seed into the project dir.
+#   * If ROCBUDAI_AGENTS_TEMPLATE is exported to an existing file (baked into
+#     the modulefile by install.sh for a cluster install, or a power-user
+#     override), it is honoured verbatim.
+#   * Otherwise the persona is auto-selected from the GPU architecture
+#     (ROCBUDAI_GFX_ARCH if set, else live `rocminfo`):
+#       gfx90a → AGENTS-gfx90a.md        (MI250X / MI210, CDNA2)
+#       gfx942 → AGENTS-default.md       (MI300A APU)  /  AGENTS-gfx942-mi300x.md (MI300X)
+#       gfx950 → AGENTS-gfx950.md        (MI355X / MI350X, CDNA4)
+# In container quick-test mode (ROCBUDAI_CONTAINER=1) we DON'T use the big
+# arch persona at all: a compact, self-contained demo persona
+# (AGENTS-container-demo.md) is used ALONE as AGENTS.md. The demo only walks a
+# tiny HIP saxpy example, and a small/fast demo model follows a short focused
+# prompt far more reliably (and starts faster) than the full ~2100-line arch
+# persona. The actual resolution runs just before the AGENTS.md seeding block
+# below (once the warn/info helpers are defined).
+ROCBUDAI_AGENTS_TEMPLATE="${ROCBUDAI_AGENTS_TEMPLATE:-}"
+ROCBUDAI_CONTAINER_DEMO_PERSONA="${ROCBUDAI_CONTAINER_DEMO_PERSONA:-${ROCBUDAI_SHARE}/AGENTS-container-demo.md}"
+
+# >>> rocbudai persona-resolver (sourceable for tests; see tests/test-persona-resolver.sh) >>>
+# Echo the first GPU agent's gfx arch (gfx90a|gfx942|gfx950) from rocminfo,
+# or nothing if rocminfo is unavailable / no match.
+_detect_gfx_arch() {
+    command -v rocminfo >/dev/null 2>&1 || return 1
+    rocminfo 2>/dev/null | grep -oE 'gfx(90a|942|950)' | head -n1
+}
+
+# gfx942 is shared by MI300A (APU) and MI300X (discrete GPU). Narrow via the
+# rocminfo Marketing Name / APU marker (mirrors install.sh detect_mi300a).
+_is_mi300a_apu() {
+    command -v rocminfo >/dev/null 2>&1 || return 1
+    rocminfo 2>/dev/null | grep -qiE 'Marketing Name:.*MI300A|APU'
+}
+
+# Echo the persona basename matching the detected (or hinted) GPU arch.
+_persona_for_arch() {
+    local arch="${ROCBUDAI_GFX_ARCH:-}"
+    [[ -n "${arch}" ]] || arch="$(_detect_gfx_arch || true)"
+    case "${arch}" in
+        gfx90a) echo "AGENTS-gfx90a.md" ;;
+        gfx950) echo "AGENTS-gfx950.md" ;;
+        gfx942) if _is_mi300a_apu; then echo "AGENTS-default.md"
+                else echo "AGENTS-gfx942-mi300x.md"; fi ;;
+        *)      warn "could not determine GPU arch (got '${arch:-none}'); defaulting to the MI300A persona — set ROCBUDAI_GFX_ARCH=gfx90a|gfx942|gfx950 or ROCBUDAI_AGENTS_TEMPLATE to override."
+                echo "AGENTS-default.md" ;;
+    esac
+}
+# <<< rocbudai persona-resolver <<<
+
+# Session resume support. The picker is the user-facing path:
+#   rocbudai                           (no flag → interactive picker if prior sessions exist)
+#   rocbudai --continue                (resume last session, skip picker)
+#   rocbudai --new                     (force a fresh session, skip picker)
+#   ROCBUDAI_CONTINUE=1 / ROCBUDAI_NEW=1 module load rocbudai  (env shorthand)
+#
+# `--session <id>` / `-s <id>` is also accepted but is intentionally NOT
+# documented in user-facing help, README, or man pages — the picker
+# (which IS the canonical UX) is what feeds session IDs to this flag
+# internally; users pick by name, not by cryptic `ses_<id>`. Removing
+# the flag here would break the picker → see pick_session() below.
+ROCBUDAI_CONTINUE="${ROCBUDAI_CONTINUE:-}"
+ROCBUDAI_SESSION="${ROCBUDAI_SESSION:-}"
+ROCBUDAI_NEW="${ROCBUDAI_NEW:-}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --continue|-c) ROCBUDAI_CONTINUE=1; shift ;;
+        --session|-s)  ROCBUDAI_SESSION="${2:-}"; shift 2 ;;
+        --new|-n)      ROCBUDAI_NEW=1; shift ;;
+        *) shift ;;
+    esac
+done
+
+# `ollama launch opencode` needs `opencode` discoverable on PATH — it
+# does NOT honour an absolute path. Make sure our staged binary is found
+# first.
+export PATH="${ROCBUDAI_OPENCODE_DIR}:${PATH}"
+
+err() { echo "[rocbudai-tui] error: $*" >&2; }
+warn() { echo "[rocbudai-tui] warning: $*" >&2; }
+info() { echo "[rocbudai-tui] $*"; }
+
+# 1. Sanity checks ------------------------------------------------------------
+#
+# These are fast preflight checks that bail before launching the TUI if the
+# environment is wrong. For a comprehensive diagnostic that also surfaces
+# warnings (e.g. partition mismatch, allow-list, opencode binary version),
+# users can run `rocbudai-doctor` directly. Any failure below also prints a
+# hint to run rocbudai-doctor.
+
+# If the user reached this compute node via ssh (e.g. `pam_slurm_adopt` letting
+# them in because they have a running allocation here), SLURM_JOB_ID is NOT
+# propagated into the shell. Recover the jobid via squeue: their unique
+# RUNNING job on this node.
+if [[ -z "${ROCBUDAI_CONTAINER:-}" && -z "${SLURM_JOB_ID:-}" ]] && command -v squeue >/dev/null 2>&1; then
+    _adopted=$(squeue -h -w "$(hostname -s)" -u "$USER" -t R -o '%i' 2>/dev/null)
+    if [[ -n "$_adopted" && $(printf '%s\n' "$_adopted" | wc -l) -eq 1 ]]; then
+        export SLURM_JOB_ID="$_adopted"
+    fi
+    unset _adopted
+fi
+
+# Container quick-test mode (ROCBUDAI_CONTAINER=1) bypasses the Slurm /
+# --comment / partition gates: there is no Slurm inside the container and
+# the LLM + bench share all GPUs. This path is for testing only.
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    info "container quick-test mode — skipping Slurm/partition gates (testing only)."
+fi
+
+if [[ -z "${ROCBUDAI_CONTAINER:-}" && -z "${SLURM_JOB_ID:-}" ]]; then
+    err "no SLURM_JOB_ID — rocbudai-tui must run inside a Slurm allocation."
+    err "from a login node, allocate one first (-p selects the GPU"
+    err "partition; --comment=ollama starts the ollama daemon for you):"
+    err "  salloc -p <gpu-partition> --exclusive --comment=ollama --time=01:00:00"
+    err "then on the compute node prompt:"
+    err "  cd <project-dir> && module load rocbudai"
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+# Resolve job comment + partition. Note: a salloc-spawned shell does NOT
+# inherit SLURM_JOB_COMMENT (Slurm only sets that var for srun / sbatch /
+# prolog / epilog contexts). SLURM_JOB_PARTITION usually IS inherited,
+# but `scontrol show job` is the authoritative source for both, so use
+# it as primary and fall back to env vars only if scontrol is missing.
+_scontrol_out=""
+if [[ -z "${ROCBUDAI_CONTAINER:-}" ]] && command -v scontrol >/dev/null 2>&1; then
+    _scontrol_out="$(scontrol show job "${SLURM_JOB_ID:-}" -o 2>/dev/null || true)"
+fi
+_job_comment=""
+_job_partition=""
+if [[ -n "$_scontrol_out" ]]; then
+    # `scontrol show job -o` prints Key=Value tokens on one line; comment
+    # values may contain commas but not spaces (Slurm rejects raw spaces
+    # in --comment unless the user quotes; even then the parser stores
+    # them with embedded \  on disk), so [^[:space:]]+ is safe.
+    _job_comment="$(  echo "$_scontrol_out" | grep -oE 'Comment=[^[:space:]]+'   | head -1 | sed 's/^Comment=//')"
+    _job_partition="$(echo "$_scontrol_out" | grep -oE 'Partition=[^[:space:]]+' | head -1 | sed 's/^Partition=//')"
+    # Slurm prints "Comment=(null)" when no comment was set; normalise.
+    [[ "$_job_comment" == "(null)" ]] && _job_comment=""
+fi
+_job_comment="${_job_comment:-${SLURM_JOB_COMMENT:-}}"
+_job_partition="${_job_partition:-${SLURM_JOB_PARTITION:-}}"
+
+# Comment-tag check (hard). Without --comment=ollama the Slurm prolog
+# never starts the daemon for THIS job, the daemon (if it happens to be
+# running from boot or an earlier job) is not tied to this allocation's
+# lifecycle, and we would otherwise fall through to the ollama
+# reachability check below — which passes against a stale daemon and
+# lets the launcher start, only for the runner to crash mid-load with
+# "model failed to load, resource limitations or internal error". Catch
+# it here with an actionable message instead.
+if [[ -z "${ROCBUDAI_CONTAINER:-}" && "${_job_comment}" != *ollama* ]]; then
+    err "this allocation's --comment is '${_job_comment:-(none)}', which does not contain 'ollama'."
+    err "rocBudAI requires --comment=ollama at salloc time so the Slurm prolog"
+    err "starts (and the epilog stops) the ollama daemon for THIS job."
+    err
+    err "to fix — release this allocation and re-allocate with --comment=ollama:"
+    err "  scancel ${SLURM_JOB_ID}"
+    err "  salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama -t 1:00:00"
+    err "  cd <project-dir> && module load rocbudai"
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+# Partition check (hard). qwen3.5:122b is a 4-GPU model that needs each
+# MI300A to be in SPX mode (full 32 GB per device). On a CPX partition
+# the GGML runner sees 24 devices, can't fit the model across them, and
+# aborts with the "internal error" message. ROCBUDAI_SPX_PARTITIONS is
+# comma-separated, set by the modulefile; we default it here so the
+# launcher still does the right thing if rocbudai-tui is invoked outside
+# `module load rocbudai`.
+# Partition allow-list (hard, but only when ROCBUDAI_SPX_PARTITIONS is set).
+# Leave it empty (note: '-', not ':-') to disable the partition gate on
+# clusters whose GPU partitions don't need SPX-style enforcement.
+_spx_partitions="${ROCBUDAI_SPX_PARTITIONS-PPAC_MI300A_SPX}"
+_spx_ok=0
+for _p in ${_spx_partitions//,/ }; do
+    if [[ -n "$_p" && "${_job_partition}" == *"$_p"* ]]; then
+        _spx_ok=1
+        break
+    fi
+done
+if [[ -z "${ROCBUDAI_CONTAINER:-}" && -n "$_spx_partitions" && "$_spx_ok" -eq 0 ]]; then
+    err "this allocation's partition is '${_job_partition:-(none)}', which is not in the rocBudAI allow-list."
+    err "the default model needs enough GPUs in full (SPX) mode; partitions that"
+    err "expose sliced GPUs (e.g. MI300A CPX/TPX) cause the runner to abort with"
+    err "'model failed to load — resource limitations or internal error'."
+    err
+    err "allowed partitions: ${_spx_partitions}"
+    err "to fix:"
+    err "  scancel ${SLURM_JOB_ID}"
+    err "  salloc -p <allowed-partition> --exclusive --comment=ollama -t 1:00:00"
+    err "  cd <project-dir> && module load rocbudai"
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+if [[ ! -t 0 || ! -t 1 ]]; then
+    err "no controlling TTY — rocbudai-tui needs an interactive shell."
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+# Model allow-list check. ROCBUDAI_ALLOWED_MODELS is a comma-separated list
+# set by the modulefile. If the user has overridden ROCBUDAI_MODEL to a name
+# that isn't in the list, fail fast with an actionable error rather than
+# letting opencode surface a confusing "model not found" deep in the TUI.
+_normalised_allowed=",${ROCBUDAI_ALLOWED_MODELS// /},"
+if [[ "${_normalised_allowed}" != *",${ROCBUDAI_MODEL},"* ]]; then
+    err "ROCBUDAI_MODEL='${ROCBUDAI_MODEL}' is not in the admin allow-list."
+    err "allowed: ${ROCBUDAI_ALLOWED_MODELS}"
+    err "to fix:  unset ROCBUDAI_MODEL ; module load rocbudai"
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+if [[ ! -x "$ROCBUDAI_OPENCODE_BIN" ]]; then
+    err "opencode binary not found / not executable: $ROCBUDAI_OPENCODE_BIN"
+    err "check that /shared/apps is mounted on this node."
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+# GPU visibility (soft check — warn only). Some users may want to use the
+# agent for non-GPU work (e.g. CPU profiling, build-system advice), so
+# missing GPUs are non-fatal here. rocbudai-doctor surfaces the count.
+if command -v rocm-smi >/dev/null 2>&1; then
+    if ! rocm-smi --showid >/dev/null 2>&1; then
+        warn "rocm-smi present but cannot enumerate GPUs."
+        warn "is this node in CPX mode? (rocBudAI requires SPX)"
+        warn "for full diagnostics:  rocbudai-doctor"
+    fi
+fi
+
+# Ollama reachability (3s timeout, no hang).
+if ! curl -fsS --max-time 3 "${ROCBUDAI_OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+    err "ollama daemon not reachable at ${ROCBUDAI_OLLAMA_HOST}."
+    err "did you allocate with --comment=ollama?  is the daemon up on this node?"
+    err "try:  systemctl is-active ollama ollama-proxy"
+    err "for full diagnostics:  rocbudai-doctor"
+    exit 1
+fi
+
+# Confirm the pinned model is actually loaded/available locally.
+if ! curl -fsS --max-time 3 "${ROCBUDAI_OLLAMA_HOST}/api/tags" \
+        | grep -q "\"${ROCBUDAI_MODEL}\""; then
+    warn "model '${ROCBUDAI_MODEL}' is not in the ollama registry on this node."
+    warn "the TUI will start, but the first prompt may fail until an admin"
+    warn "runs:  sudo -u ollama ollama pull ${ROCBUDAI_MODEL}"
+    warn "for full diagnostics:  rocbudai-doctor"
+fi
+
+# 1.5. Session picker --------------------------------------------------------
+#
+# When the user runs `module load rocbudai` (no flag), we look for prior
+# sessions associated with the launching cwd and offer a numbered menu so
+# they can resume by name. The list is sourced from
+# `opencode session list --format json`, joined with the per-project
+# sidecar `./.rocbudai-sessions.json` (written by `rocbudai-name-session`
+# during the discovery interview's Q1/7) for human-readable names.
+#
+# Filter modes:
+#   - "project"   — launching cwd is a normal writable dir; show only
+#                   sessions whose `directory` field equals it.
+#   - "all-runs"  — launching cwd is $HOME or unwritable; show sessions
+#                   across every $HOME/rocbudai-runs/*/ subdir, so the
+#                   user gets the same picker UX regardless of where
+#                   they re-loaded the module from. Picking a session
+#                   chdirs to its original project dir before launch.
+#
+# Picker is BYPASSED when:
+#   - --continue / --session <id> / --new is passed (or the corresponding
+#     env vars are set);
+#   - stdin or stdout is not a TTY (no interactive prompt possible);
+#   - opencode session list returns no sessions for the relevant filter.
+#
+# On numeric pick: sets PICKED_SESSION_ID and PICKED_PROJECT_DIR; the
+# main flow then chdirs and passes --session to opencode.
+# On 'n' (new): falls through to the normal fresh-session path.
+# On 'q' (cancel): exits cleanly with code 0.
+
+PICKED_SESSION_ID=""
+PICKED_PROJECT_DIR=""
+
+pick_session() {
+    [[ -n "$ROCBUDAI_CONTINUE" ]] && return 0
+    [[ -n "$ROCBUDAI_SESSION"  ]] && return 0
+    [[ -n "$ROCBUDAI_NEW"      ]] && return 0
+    [[ ! -t 0 || ! -t 1        ]] && return 0
+
+    local cwd_at_launch
+    cwd_at_launch="$(pwd)"
+
+    local filter_mode="project"
+    if [[ "$cwd_at_launch" == "$HOME" ]] || [[ ! -w "$cwd_at_launch" ]]; then
+        filter_mode="all-runs"
+    fi
+
+    local sessions_json
+    # --pure: skip plugin loading for this short-lived read-only probe.
+    # opencode 1.14.28's plugin auto-discovery (scanning .opencode/plugins/
+    # for *.js) wedges short-lived subcommands like `session list` for
+    # >10 s regardless of plugin contents — even an empty {} plugin
+    # hangs it. The TUI launch itself (further down) does NOT use --pure
+    # so any plugins declared explicitly via opencode.json's "plugin"
+    # field still load normally during the chat session.
+    sessions_json="$("$ROCBUDAI_OPENCODE_BIN" --pure session list --format json 2>/dev/null || echo '[]')"
+
+    # NOTE: every python3 invocation below receives its input via env var, NOT
+    # stdin, because `python3 - <<'PY'` redirects stdin to the heredoc body
+    # and would discard a piped value.
+    local menu_data
+    menu_data="$(
+        SESSIONS_JSON="$sessions_json" FILTER_MODE="$filter_mode" \
+        CWD="$cwd_at_launch" HOME_DIR="$HOME" \
+        python3 - <<'PY'
+import json, os, sys, time
+
+def humanize_age(updated_ms):
+    if not updated_ms:
+        return "?"
+    age = time.time() - (updated_ms / 1000.0)
+    if age <  60:        return f"{int(age)}s ago"
+    if age <  3600:      return f"{int(age/60)}m ago"
+    if age <  86400:     return f"{int(age/3600)}h ago"
+    return f"{int(age/86400)}d ago"
+
+mode = os.environ['FILTER_MODE']
+cwd  = os.environ['CWD']
+home = os.environ['HOME_DIR']
+runs_prefix = os.path.join(home, 'rocbudai-runs') + '/'
+
+try:
+    sessions = json.loads(os.environ.get('SESSIONS_JSON') or '[]')
+except Exception:
+    sessions = []
+
+if mode == 'project':
+    cands = [x for x in sessions if x.get('directory') == cwd]
+else:
+    cands = [x for x in sessions if (x.get('directory') or '').startswith(runs_prefix)]
+
+cands.sort(key=lambda x: -x.get('updated', 0))
+
+# Per-directory sidecar lookup (cache so we don't re-read the same file).
+sidecar_cache = {}
+def lookup_name(d, sid):
+    if not d:
+        return None
+    sf = os.path.join(d, '.rocbudai-sessions.json')
+    if sf not in sidecar_cache:
+        try:
+            sidecar_cache[sf] = json.load(open(sf))
+        except Exception:
+            sidecar_cache[sf] = {}
+    return sidecar_cache[sf].get(sid, {}).get('name')
+
+rows = []
+for c in cands:
+    rows.append({
+        'id':        c['id'],
+        'directory': c.get('directory') or '',
+        'title':     c.get('title') or '',
+        'name':      lookup_name(c.get('directory') or '', c['id']),
+        'age':       humanize_age(c.get('updated')),
+    })
+
+print(json.dumps({'count': len(rows), 'mode': mode, 'rows': rows}))
+PY
+    )"
+
+    local count
+    count="$(MENU="$menu_data" python3 -c "import os, json; print(json.loads(os.environ['MENU'])['count'])")"
+    [[ "${count:-0}" -eq 0 ]] && return 0
+
+    echo
+    if [[ "$filter_mode" == "project" ]]; then
+        info "found ${count} prior session(s) in this project (${cwd_at_launch}):"
+    else
+        info "found ${count} prior session(s) under \$HOME/rocbudai-runs/:"
+    fi
+    info "tip: to clean up old / unused sessions, /exit and run 'rocbudai-prune-sessions'."
+
+    MENU="$menu_data" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ['MENU'])
+for i, r in enumerate(d['rows'], start=1):
+    label = r['name'] or r['title'] or '(unnamed)'
+    if d['mode'] == 'all-runs':
+        short = r['directory'].rsplit('/', 1)[-1] or r['directory']
+        print(f"    [{i:>2}] {label:<32} {r['age']:<8}  ({short})")
+    else:
+        print(f"    [{i:>2}] {label:<40} {r['age']}")
+print( "    [ n] start a new session")
+print( "    [ q] cancel")
+PY
+    echo
+
+    local reply
+    read -r -p "  choice [1]: " reply || reply=""
+    reply="${reply:-1}"
+    reply="${reply## }"; reply="${reply%% }"
+
+    case "$reply" in
+        n|N|new|NEW)
+            info "starting a new session."
+            return 0
+            ;;
+        q|Q|cancel|CANCEL|quit|QUIT|exit|EXIT)
+            info "cancelled."
+            exit 0
+            ;;
+        ''|*[!0-9]*)
+            err "invalid choice '$reply' (expected 1..${count}, n, or q)."
+            err "run 'module load rocbudai' again to retry, or use --new / --continue."
+            exit 2
+            ;;
+    esac
+
+    if [[ "$reply" -lt 1 || "$reply" -gt "$count" ]]; then
+        err "choice ${reply} is out of range 1..${count}."
+        exit 2
+    fi
+
+    local chosen
+    chosen="$(MENU="$menu_data" IDX="$reply" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ['MENU'])
+i = int(os.environ['IDX']) - 1
+r = d['rows'][i]
+print(r['id'])
+print(r['directory'])
+PY
+    )"
+    PICKED_SESSION_ID="$(  echo "$chosen" | sed -n '1p')"
+    PICKED_PROJECT_DIR="$( echo "$chosen" | sed -n '2p')"
+
+    if [[ -z "$PICKED_SESSION_ID" || -z "$PICKED_PROJECT_DIR" ]]; then
+        err "internal: failed to extract chosen session row."
+        exit 2
+    fi
+
+    info "resuming session ${PICKED_SESSION_ID} in ${PICKED_PROJECT_DIR}"
+}
+
+pick_session
+
+if [[ -n "$PICKED_SESSION_ID" ]]; then
+    if [[ ! -d "$PICKED_PROJECT_DIR" ]]; then
+        err "picked project dir no longer exists: $PICKED_PROJECT_DIR"
+        err "the session may have been created in a since-deleted directory."
+        exit 1
+    fi
+    cd "$PICKED_PROJECT_DIR"
+    ROCBUDAI_SESSION="$PICKED_SESSION_ID"
+fi
+
+# 2. Working directory --------------------------------------------------------
+#
+# Default: current pwd if writable AND not $HOME root (we don't want
+# scratch files in the user's home root — they'd collide with the
+# user's own AGENTS.md / opencode.json from other projects, and the
+# per-session git snapshot opencode keeps under cwd interacts badly
+# with $HOME itself).
+#
+# Fallback when cwd is $HOME or unwritable:
+#   - fresh session    → ~/rocbudai-runs/<timestamp>/ (new dir per launch)
+#   - --continue / --session → most recent existing ~/rocbudai-runs/*/
+#     (opencode keys session storage by project = cwd, so resuming into
+#     a brand-new empty dir would silently find no prior sessions and
+#     drop the user into an empty TUI).
+#
+# Note: if the picker above already chose a session, we are now sitting
+# in that session's project dir (which is by definition writable and
+# not $HOME — it was discovered via opencode session list), so this
+# block is a no-op in the picker-resume path.
+
+cwd="$(pwd)"
+ROCBUDAI_CWD_AUTOCREATED=0
+if [[ "$cwd" == "$HOME" ]] || [[ ! -w "$cwd" ]]; then
+    if [[ -n "$ROCBUDAI_CONTINUE" || -n "$ROCBUDAI_SESSION" ]]; then
+        latest=""
+        if [[ -d "$HOME/rocbudai-runs" ]]; then
+            latest="$(ls -1dt "$HOME"/rocbudai-runs/*/ 2>/dev/null | head -n1)"
+            latest="${latest%/}"
+        fi
+        if [[ -z "$latest" ]]; then
+            err "no prior session dirs under $HOME/rocbudai-runs/ — nothing to resume."
+            err "drop --continue/--session to start fresh, or cd into the project"
+            err "dir where you originally launched the session you want to resume."
+            exit 1
+        fi
+        cwd="$latest"
+        info "resuming in latest session dir: $cwd"
+    else
+        cwd="$HOME/rocbudai-runs/$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$cwd"
+        ROCBUDAI_CWD_AUTOCREATED=1
+        info "current dir was \$HOME or not writable; created fresh $cwd"
+        info "files in this dir persist after logout — to resume later:"
+        info "  cd $cwd && rocbudai --continue"
+    fi
+    cd "$cwd"
+fi
+
+# 3. Bootstrap opencode.json + AGENTS.md if missing --------------------------
+
+# Pick which template (ASK vs AUTO-RUN) and decide whether to force-rewrite.
+#
+# Semantics:
+#   ROCBUDAI_AUTORUN unset       → ASK mode default; preserve any existing
+#                                opencode.json (so user-customised configs
+#                                survive across module loads).
+#   ROCBUDAI_AUTORUN=1|true|on   → AUTO-RUN; force-rewrite opencode.json
+#                                from the allow-all template every load,
+#                                so toggling back via `unset` works.
+#   ROCBUDAI_AUTORUN=0|false|off → ASK mode; force-rewrite from default
+#                                template (this is the toggle-back path).
+#
+# Force-rewrite when the env var is set (either value) is intentional:
+# without it, `export ROCBUDAI_AUTORUN=0; module load rocbudai` after an
+# AUTO-RUN session would silently keep the allow-all opencode.json.
+
+case "${ROCBUDAI_AUTORUN:-}" in
+    1|true|yes|on)
+        ROCBUDAI_OPENCODE_TEMPLATE="${ROCBUDAI_SHARE}/opencode-allow-all.json"
+        ROCBUDAI_PERMISSION_MODE="AUTO-RUN"
+        ROCBUDAI_FORCE_REWRITE=1
+        ;;
+    0|false|no|off)
+        ROCBUDAI_OPENCODE_TEMPLATE="${ROCBUDAI_SHARE}/opencode-default.json"
+        ROCBUDAI_PERMISSION_MODE="ASK"
+        ROCBUDAI_FORCE_REWRITE=1
+        ;;
+    "")
+        ROCBUDAI_OPENCODE_TEMPLATE="${ROCBUDAI_SHARE}/opencode-default.json"
+        ROCBUDAI_PERMISSION_MODE="ASK"
+        ROCBUDAI_FORCE_REWRITE=0
+        ;;
+    *)
+        warn "ROCBUDAI_AUTORUN='${ROCBUDAI_AUTORUN}' not understood; defaulting to ASK."
+        ROCBUDAI_OPENCODE_TEMPLATE="${ROCBUDAI_SHARE}/opencode-default.json"
+        ROCBUDAI_PERMISSION_MODE="ASK"
+        ROCBUDAI_FORCE_REWRITE=1
+        ;;
+esac
+
+# Also auto-refresh opencode.json if the template is newer than the local
+# copy (matches AGENTS.md auto-refresh semantics from Change 6 — admin-
+# pushed permission policy updates, e.g. new deny patterns, propagate to
+# every next `module load rocbudai`). User who wants to pin a custom
+# opencode.json can `chmod 0444 opencode.json` or set
+# ROCBUDAI_OPENCODE_NOREFRESH=1.
+if [[ -f opencode.json \
+      && -z "${ROCBUDAI_OPENCODE_NOREFRESH:-}" \
+      && $ROCBUDAI_FORCE_REWRITE -eq 0 \
+      && "$ROCBUDAI_OPENCODE_TEMPLATE" -nt opencode.json ]]; then
+    ROCBUDAI_FORCE_REWRITE=1
+    info "opencode.json template is newer — refreshing from ${ROCBUDAI_PERMISSION_MODE} template"
+fi
+
+if [[ ! -f opencode.json || $ROCBUDAI_FORCE_REWRITE -eq 1 ]]; then
+    # Two substitutions into the template:
+    #
+    # 1. Active model into the "model" field so the JSON matches the --model
+    #    flag passed to `ollama launch`. Defence in depth: if opencode's
+    #    precedence ever favours JSON over CLI, this keeps us correct. The
+    #    regex matches any "ollama/..." model so it is robust to template
+    #    default changes.
+    #
+    # 2. The "instructions" entry "AGENTS.md" (relative) → the ABSOLUTE path
+    #    of the AGENTS.md we write in this same dir. opencode resolves
+    #    instruction paths relative to where opencode actually runs and only
+    #    traverses up to the nearest *git* root — so a relative "AGENTS.md"
+    #    is NOT loaded when the working dir is a subdirectory of a git repo
+    #    (e.g. the container demo runs in HIP/saxpy inside the
+    #    HPCTrainingExamples clone; the persona silently never reached the
+    #    model). An absolute path is opencode's documented fix and loads the
+    #    persona regardless of cwd / git-root. ${cwd} is the abs dir we cd'd
+    #    into above and where AGENTS.md is written.
+    sed -E -e "s|\"model\":[[:space:]]*\"ollama/[^\"]*\"|\"model\": \"ollama/${ROCBUDAI_MODEL}\"|" \
+           -e "s|\"AGENTS\.md\"|\"${cwd}/AGENTS.md\"|" \
+        "${ROCBUDAI_OPENCODE_TEMPLATE}" > opencode.json
+    chmod 0644 opencode.json
+    info "wrote opencode.json (${ROCBUDAI_PERMISSION_MODE} mode, model=${ROCBUDAI_MODEL})"
+fi
+
+# AGENTS.md: seed from the arch-specific persona (resolved here, now that the
+# logging helpers exist) and, in container quick-test mode, prefix the
+# container overrides. Refresh if AGENTS.md is missing OR a source file is
+# newer than the local copy — admin template updates then propagate to every
+# next `module load rocbudai`. Users who want to pin a custom AGENTS.md can
+# `chmod 0444` it or set `ROCBUDAI_AGENTS_NOREFRESH=1`.
+
+if [[ -n "${ROCBUDAI_AGENTS_TEMPLATE}" && -f "${ROCBUDAI_AGENTS_TEMPLATE}" ]]; then
+    : # honour an explicit, existing override (modulefile-baked or user export)
+elif [[ -n "${ROCBUDAI_CONTAINER:-}" && -f "${ROCBUDAI_CONTAINER_DEMO_PERSONA}" ]]; then
+    # Container quick-test: use the compact, self-contained demo persona
+    # ALONE. We deliberately do NOT fall through to the big arch persona —
+    # the demo is a tiny saxpy walkthrough and a small model follows a short
+    # focused prompt far more reliably than the full ~2100-line persona.
+    ROCBUDAI_AGENTS_TEMPLATE="${ROCBUDAI_CONTAINER_DEMO_PERSONA}"
+else
+    [[ -n "${ROCBUDAI_AGENTS_TEMPLATE}" ]] && \
+        warn "ROCBUDAI_AGENTS_TEMPLATE='${ROCBUDAI_AGENTS_TEMPLATE}' not found; autodetecting persona by GPU arch."
+    ROCBUDAI_AGENTS_TEMPLATE="${ROCBUDAI_SHARE}/$(_persona_for_arch)"
+fi
+
+# Emit the effective persona to stdout. ROCBUDAI_AGENTS_TEMPLATE already
+# points at the right file (the compact demo persona in container mode, the
+# arch persona otherwise), so this is a straight copy — no prepend.
+_emit_persona() {
+    cat "${ROCBUDAI_AGENTS_TEMPLATE}"
+}
+
+# Return 0 if AGENTS.md must be (re)written.
+_agents_needs_refresh() {
+    [[ -f AGENTS.md ]] || return 0
+    [[ -z "${ROCBUDAI_AGENTS_NOREFRESH:-}" ]] || return 1
+    [[ "${ROCBUDAI_AGENTS_TEMPLATE}" -nt AGENTS.md ]] && return 0
+    return 1
+}
+
+_persona_label="$(basename "${ROCBUDAI_AGENTS_TEMPLATE}")"
+[[ -n "${ROCBUDAI_CONTAINER:-}" ]] && _persona_label="${_persona_label} (container demo)"
+
+if [[ ! -f AGENTS.md ]]; then
+    _emit_persona > AGENTS.md
+    chmod 0644 AGENTS.md
+    info "wrote AGENTS.md (${_persona_label})"
+elif _agents_needs_refresh; then
+    _emit_persona > AGENTS.md
+    chmod 0644 AGENTS.md
+    info "refreshed AGENTS.md (${_persona_label})"
+fi
+
+# Container quick-test ONLY: ALSO install the persona as opencode's GLOBAL
+# rules file (~/.config/opencode/AGENTS.md).
+#
+# ROOT CAUSE this works around (found 2026-06-30 from ollama's source,
+# cmd/launch/opencode.go): we launch opencode via `ollama launch opencode`,
+# which injects its OWN inline config through the OPENCODE_CONFIG_CONTENT env
+# var — the HIGHEST-precedence opencode config (above project opencode.json).
+# That inline config contains only the provider + model and NO "instructions"
+# key, and ollama appends it AFTER our environment, so it both outranks our
+# project config and clobbers any OPENCODE_CONFIG/OPENCODE_CONFIG_CONTENT we
+# set. Net effect: our project-level `instructions: ["AGENTS.md"]` never
+# reaches the model and the persona is silently dropped — which is why the
+# demo model only ever saw opencode's built-in prompt and ignored the persona.
+#
+# The one channel ollama launch CANNOT clobber: ollama's docs guarantee it
+# "does not overwrite ~/.config/opencode/opencode.json; existing OpenCode
+# settings still apply", and opencode ALWAYS loads ~/.config/opencode/AGENTS.md
+# as GLOBAL rules, merged into context in addition to (and independent of) any
+# project config or inline override. Writing the persona there guarantees it
+# reaches the model regardless of the launch path.
+#
+# Gated to the container (throwaway, single-user, root) so we never leak a
+# persona into a real user's global opencode sessions on a shared login node.
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    _global_rules_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/opencode"
+    if mkdir -p "${_global_rules_dir}" 2>/dev/null; then
+        _emit_persona > "${_global_rules_dir}/AGENTS.md"
+        chmod 0644 "${_global_rules_dir}/AGENTS.md" 2>/dev/null || true
+        info "wrote ${_global_rules_dir}/AGENTS.md (global rules — survives the 'ollama launch' inline-config override)"
+    else
+        warn "could not create ${_global_rules_dir}; persona may not reach the model under 'ollama launch'"
+    fi
+fi
+
+# Stale rocbudai-auto-nudge.js cleanup (one-time migration self-heal).
+#
+# Background: an earlier iteration of rocbudai-tui copied a plugin into
+# the project's .opencode/plugins/ dir to inject continuation prompts
+# when the model ended a turn with only a tool call. The plugin had two
+# fundamental design bugs (noReply messages do not trigger the model;
+# tool results visible to the user were mis-counted as "lazy") and was
+# pulled. The continuation-prompt feature is being rebuilt as an
+# out-of-process watcher (libexec/rocbudai-nudge-watcher); not a plugin.
+#
+# Returning users who installed the old version may still have a stale
+# .opencode/plugins/rocbudai-auto-nudge.js sitting in their project. Any
+# file in .opencode/plugins/ ALSO triggers a separate opencode 1.14.28
+# bug — the plugin auto-discovery scan wedges short-lived subcommands
+# (`opencode session list --format json`) and TUI bootstrap for >10 s
+# regardless of plugin contents. So we proactively remove any stale
+# rocbudai plugin file plus the now-empty parent dirs.
+#
+# We do NOT touch user-installed third-party plugin files in the same
+# directory (none currently shipped by rocBudAI; if a user dropped their
+# own plugin in there, that's their choice and they own the consequences
+# — the --pure on the session-list probes above is the defence layer
+# that keeps the picker working even in that case).
+if [[ -f .opencode/plugins/rocbudai-auto-nudge.js ]]; then
+    rm -f .opencode/plugins/rocbudai-auto-nudge.js
+    info "removed stale .opencode/plugins/rocbudai-auto-nudge.js (the auto-nudge plugin was retired; continuation prompts are now handled out-of-process)"
+fi
+if [[ -d .opencode/plugins ]] && [[ -z "$(ls -A .opencode/plugins 2>/dev/null)" ]]; then
+    rmdir .opencode/plugins 2>/dev/null || true
+    rmdir .opencode 2>/dev/null || true
+fi
+
+# Resolve the session ID and (if known) the user-given session name for
+# the runtime-context file the agent reads at §0. We look up the ID for
+# three cases:
+#   - explicit --session <id>
+#   - picker pick (PICKED_SESSION_ID)
+#   - --continue (most-recently-updated session whose directory == cwd)
+# When fresh (no resume), both fields stay empty and the agent will ask
+# Q1/7 to set the name during discovery.
+ROCBUDAI_SESSION_ID=""
+ROCBUDAI_SESSION_NAME=""
+if [[ -n "$ROCBUDAI_SESSION" ]]; then
+    ROCBUDAI_SESSION_ID="$ROCBUDAI_SESSION"
+elif [[ -n "$ROCBUDAI_CONTINUE" ]]; then
+    # --pure: see comment at the matching call site in pick_session() above.
+    # Read-only session probe must skip plugin auto-discovery to avoid
+    # the >10 s wedge in opencode 1.14.28 one-shot subcommands.
+    _sessions_json="$("$ROCBUDAI_OPENCODE_BIN" --pure session list --format json 2>/dev/null || echo '[]')"
+    ROCBUDAI_SESSION_ID="$(
+        SESSIONS_JSON="$_sessions_json" CWD="$(pwd)" python3 - <<'PY'
+import json, os
+try:
+    s = json.loads(os.environ.get('SESSIONS_JSON') or '[]')
+except Exception:
+    s = []
+cwd = os.environ['CWD']
+m = [x for x in s if x.get('directory') == cwd]
+m.sort(key=lambda x: -x.get('updated', 0))
+if m:
+    print(m[0]['id'])
+PY
+    )"
+fi
+if [[ -n "$ROCBUDAI_SESSION_ID" && -f .rocbudai-sessions.json ]]; then
+    ROCBUDAI_SESSION_NAME="$(SID="$ROCBUDAI_SESSION_ID" python3 - <<'PY'
+import json, os, sys
+try:
+    d = json.load(open('.rocbudai-sessions.json'))
+except Exception:
+    sys.exit(0)
+print(d.get(os.environ['SID'], {}).get('name', ''))
+PY
+    )"
+fi
+
+# Always (re-)write .rocbudai-runtime.md with the per-session context.
+# AGENTS.md §0 tells the agent to Read this file silently and embed its
+# values at the top of the welcome banner — this is how the runtime
+# context (hostname, slurm job, model, cwd) survives the brief
+# pre-TUI shell preamble that gets cleared when opencode takes over
+# the screen. Overwriting each session is intentional: stale values
+# from a previous Slurm job would mislead the user.
+
+# Compute a display-friendly abbreviation of the working dir. Used ONLY
+# in the visible Session-info banner block — the full path is still
+# written to the `Working dir` field below so the resume-hint line
+# (`cd <full path> && rocbudai --continue`) stays exact. This avoids
+# the visual chaos seen in narrow terminals where deep project paths
+# (>100 chars) wrapped over the opencode TUI's streaming spinner and
+# rendered as garbled tokens.
+_abbrev_path() {
+    local p="$1"
+    local maxlen=70
+    # Step 1: collapse $HOME prefix to ~ (anchored on / or end-of-string
+    # so /home/admin-other does NOT become ~-other).
+    if [[ -n "${HOME:-}" && ( "$p" == "$HOME" || "$p" == "$HOME/"* ) ]]; then
+        p="~${p#"$HOME"}"
+    fi
+    if [[ "${#p}" -le "$maxlen" ]]; then
+        printf '%s' "$p"
+        return
+    fi
+    # Step 2: middle elision. Keep "<head>/.../<last-two-segments>".
+    local IFS='/'
+    local -a segs
+    read -ra segs <<< "$p"
+    local n="${#segs[@]}"
+    if [[ "$n" -lt 4 ]]; then
+        # Not enough segments to elide meaningfully; leave as-is.
+        printf '%s' "$p"
+        return
+    fi
+    local head
+    if [[ -z "${segs[0]}" ]]; then
+        # Absolute path (segs[0] is empty before the leading /).
+        head="/${segs[1]}"
+    else
+        head="${segs[0]}/${segs[1]}"
+    fi
+    local tail="${segs[$((n-2))]}/${segs[$((n-1))]}"
+    printf '%s/.../%s' "$head" "$tail"
+}
+_ROCBUDAI_CWD_FULL="$(pwd)"
+_ROCBUDAI_CWD_DISPLAY="$(_abbrev_path "$_ROCBUDAI_CWD_FULL")"
+
+cat > .rocbudai-runtime.md <<EOF
+# rocbudai session runtime context
+
+Generated by \`rocbudai-tui\` at session start. The agent reads this
+file in the §0 resumed-session block to detect a prior \`Session name\`
+(if any) and to summarise prior context. Safe to delete; will be
+regenerated on the next \`module load rocbudai\`.
+
+| Key                  | Value                                |
+|----------------------|--------------------------------------|
+| Node                 | $(hostname)                          |
+| User name            | ${USER:-$(id -un)}                   |
+| User home            | ${HOME:-(unset)}                     |
+| Slurm job ID         | ${SLURM_JOB_ID:-(not in alloc)}      |
+| Slurm partition      | ${SLURM_JOB_PARTITION:-(unknown)}    |
+| Model                | ${ROCBUDAI_MODEL}                    |
+| Working dir          | ${_ROCBUDAI_CWD_FULL}                |
+| Working dir display  | ${_ROCBUDAI_CWD_DISPLAY}             |
+| Working dir auto-created | ${ROCBUDAI_CWD_AUTOCREATED}      |
+| Ollama host          | ${ROCBUDAI_OLLAMA_HOST}              |
+| Session ID           | ${ROCBUDAI_SESSION_ID:-(new)}        |
+| Session name         | ${ROCBUDAI_SESSION_NAME:-(unnamed)}  |
+| Started at           | $(date -Is)                          |
+EOF
+chmod 0644 .rocbudai-runtime.md
+
+# Also write .rocbudai-banner.md — the FULLY-SUBSTITUTED welcome banner.
+# AGENTS.md §0 Step 1 (post-Phase-4.1, 2026-05-12) tells the agent to
+# Read this file and emit its contents verbatim, with no substitution
+# responsibility on the model side. This eliminates the §0 "Read template
+# then substitute placeholders" pattern that qwen3.5:122b failed in the
+# Phase-2 stress test (banner-placeholder leak: model printed the literal
+# "<Node from .rocbudai-runtime.md>" template text, or invented strings
+# like "(no prior session available)"). Bash has no interpretation
+# variance; moving the substitution here removes the failure mode for
+# every model, current and future.
+#
+# Why both files: .rocbudai-runtime.md is still the resumed-session
+# context source (§0 resumed-session block uses Session name + earlier
+# fields). .rocbudai-banner.md is fresh-session-only — the agent only
+# Reads it on the first turn of a NEW session.
+_ROCBUDAI_BANNER_AUTOLINE=""
+if [[ "${ROCBUDAI_CWD_AUTOCREATED}" == "1" ]]; then
+    # Use ANSI-C $'...' so the literal $HOME inside the parenthetical
+    # survives the heredoc's variable expansion (heredoc expands the
+    # value of _ROCBUDAI_BANNER_AUTOLINE once but does NOT recurse into
+    # the expanded text).
+    _ROCBUDAI_BANNER_AUTOLINE=$'\n               (auto-created from $HOME — files persist after logout)'
+fi
+
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    # Container quick-test banner. No Slurm/partition/module concepts apply
+    # here, so the cluster banner's --comment / `module load rocbudai`
+    # resume + auto-run hints are dropped to avoid confusing a first-time
+    # tester. The discovery interview is pre-answered (see the standalone
+    # AGENTS-container-demo.md persona); we tell the user they can just hit
+    # Enter. NOTE: the demo persona instructs the model to emit its own
+    # welcome paragraph, not to read this .rocbudai-banner.md — this file is
+    # written for parity but is unused in the container demo path.
+    cat > .rocbudai-banner.md <<EOF
+Welcome to the rocBudAI quick-test — a guided demo of the AMD GPU
+profiling assistant.
+
+Session info:
+  Node:        $(hostname)
+  Model:       ${ROCBUDAI_MODEL}
+  Working dir: ${_ROCBUDAI_CWD_DISPLAY}${_ROCBUDAI_BANNER_AUTOLINE}
+
+This is a CONTAINER quick-test (testing only): ROCm is preinstalled, there
+are no Lmod modules, and the LLM and your code share the GPU. We start from
+the HIP saxpy example so you can watch the whole flow on a tiny kernel.
+
+I am running in ASK mode: I pause for your y/Enter approval before any
+non-trivial command; read-only commands (ls, cat, rocminfo, rocm-smi) run
+without nagging.
+
+Auto-nudge: if a turn ends and we sit idle for 240 s, I'll inject a
+"continue" myself so we don't both wait. It shows up in the transcript.
+
+To exit: type /exit or Ctrl-D.
+
+Let's scope the run. I will ask seven short questions, one at a time. For
+each I'll suggest the quick-test answer — just press Enter or reply "ok"
+to accept it. Here's the first:
+EOF
+else
+    cat > .rocbudai-banner.md <<EOF
+Welcome to rocBudAI — your AMD GPU profiling assistant.
+
+Session info:
+  Node:        $(hostname)
+  Slurm job:   ${SLURM_JOB_ID:-(not in alloc)}
+  Partition:   ${SLURM_JOB_PARTITION:-(unknown)}
+  Model:       ${ROCBUDAI_MODEL}
+  Working dir: ${_ROCBUDAI_CWD_DISPLAY}${_ROCBUDAI_BANNER_AUTOLINE}
+
+Privacy: your code, chats, and model responses stay on this node while
+this job runs. Verify: rocbudai-airgap-check
+
+I am running in ASK mode (the default). Every non-trivial bash command
+I want to run will pause and wait for your y/Enter approval. Read-only
+commands like ls, cat, module list, rocm-smi, and rocminfo are
+pre-approved so I do not nag you for trivial introspection.
+
+If you would rather have me run everything without prompts (auto-run
+mode), type /exit, then run:
+
+    export ROCBUDAI_AUTORUN=1
+    module load rocbudai
+
+To go back to ASK mode:  \`unset ROCBUDAI_AUTORUN; module load rocbudai\`
+(or \`export ROCBUDAI_AUTORUN=0; module load rocbudai\`).
+
+Auto-nudge: if a turn ends and the session stays idle for 240 s, I'll
+inject a "continue" myself so we don't both sit there waiting. The
+nudge is a normal user message and will show up in the transcript.
+To tighten / loosen / disable, before \`module load rocbudai\`:
+
+    export ROCBUDAI_NUDGE_AFTER_S=60     # tighter loop (default 240 s)
+    export ROCBUDAI_NUDGE_DISABLE=1      # turn off entirely
+
+To exit: type /exit or Ctrl-D.
+To resume this session later: cd ${_ROCBUDAI_CWD_FULL} && rocbudai --continue
+  (or just \`module load rocbudai\` from the same dir — you'll see a
+  picker of prior sessions and can pick this one by name.)
+
+Let's scope the run. I will ask seven short questions, one at a time.
+Here's the first:
+EOF
+fi
+chmod 0644 .rocbudai-banner.md
+
+# 4. Exec opencode via `ollama launch` ----------------------------------------
+#
+# We launch opencode via `ollama launch opencode --model …` rather than the
+# raw opencode binary, because `ollama launch` is what wires up the ollama
+# provider in opencode's config (otherwise the TUI shows a generic fallback
+# model like "big pickle" instead of our pinned model). This matches what
+# the iter_01/02 manual runs did. Project-local opencode.json (permissions,
+# instructions, share=disabled) is still read by opencode regardless of
+# launch path — verified in iter_02.
+
+if ! command -v ollama >/dev/null 2>&1; then
+    err "ollama not found on PATH on this node."
+    exit 1
+fi
+
+# Tell the ollama CLI (and `ollama launch` in particular) which daemon
+# to talk to. The ollama CLI honours OLLAMA_HOST as `host:port` (no
+# scheme), and defaults to 127.0.0.1:11434 otherwise — which is fine
+# in production (where the step-8 auth proxy lives on :11434 and the
+# bare daemon on :11435 sits behind it), but broken in no-systemd
+# test containers where step 8 is skipped: the bare daemon binds
+# :11435 and there is no proxy on :11434, so `ollama launch` would
+# silently hit a dead port and opencode would exit immediately after
+# its first /api/tags probe. Strip the scheme from
+# ROCBUDAI_OLLAMA_HOST (which is a URL, e.g. http://127.0.0.1:11435)
+# and export. This is also the right thing to do in production: it
+# pins clients to whatever endpoint the modulefile selected, instead
+# of relying on the ollama CLI's default matching by coincidence.
+_ollama_host_for_cli="${ROCBUDAI_OLLAMA_HOST#http://}"
+_ollama_host_for_cli="${_ollama_host_for_cli#https://}"
+_ollama_host_for_cli="${_ollama_host_for_cli%/}"
+export OLLAMA_HOST="${_ollama_host_for_cli}"
+
+# Bash-tool default timeout for opencode. Upstream default is 120 s
+# (packages/opencode/src/tool/bash.ts), which is too low for typical
+# rocBudAI work — a `mpirun -np N rocprofv3 -- ./app` profile run
+# routinely exceeds 2 min on a real workload. The model was getting
+# bash-tool SIGKILL after 120 s, mis-attributing it to "rocprofv3
+# needs more time to finalize trace collection" (AGENTS-default.md
+# § 1 rule 12 educates the model on the actual source), and looping
+# on "raise the timeout, retry". Setting this env var raises the
+# DEFAULT to 600 s (10 min) on every bash call. opencode's per-call
+# hard cap is also 600 s — there is no way upstream to push higher
+# without forking, so this is the longest tail we can give. The
+# OPENCODE_EXPERIMENTAL_ prefix is upstream-marked "experimental";
+# if a future opencode bump renames or drops it, our default reverts
+# to 120 s silently — re-check this on every opencode upgrade.
+export OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=600000
+
+# Pin off opencode's network-touching features (auto-update version check, LSP
+# download, models-catalog fetch, external skills, cloud share). On the host
+# these are also set by the modulefile, but the --container quick-test has no
+# `module load`, so without this opencode prompts to update on launch and then
+# hangs on the network call (no/blocked egress). Setting them here covers BOTH
+# paths and is the single source of truth. `:-1` keeps any explicit override
+# (e.g. a user who really wants the update check) working.
+export OPENCODE_DISABLE_AUTOUPDATE="${OPENCODE_DISABLE_AUTOUPDATE:-1}"
+export OPENCODE_DISABLE_LSP_DOWNLOAD="${OPENCODE_DISABLE_LSP_DOWNLOAD:-1}"
+export OPENCODE_DISABLE_MODELS_FETCH="${OPENCODE_DISABLE_MODELS_FETCH:-1}"
+export OPENCODE_DISABLE_EXTERNAL_SKILLS="${OPENCODE_DISABLE_EXTERNAL_SKILLS:-1}"
+export OPENCODE_DISABLE_SHARE="${OPENCODE_DISABLE_SHARE:-1}"
+
+# Force opencode to load OUR config — do not rely on cwd / git-root discovery.
+#
+# Root cause of the "persona never reaches the model" bug: `ollama launch
+# opencode` does not necessarily run opencode with our working dir as its
+# project root, so opencode never discovers the opencode.json (and therefore
+# the "instructions" persona) we wrote in ${cwd}. Symptom: the model's first
+# turn shows ONLY opencode's built-in system prompt (todo-tool guidance, no
+# rocBudAI) and it hallucinates / treats the seed as a status message.
+#
+# OPENCODE_CONFIG is opencode's documented "custom config" override: an
+# absolute path to a config file, honoured regardless of cwd. Combined with
+# the absolute "instructions" path we sed into opencode.json above, this
+# guarantees the persona loads. `:-` keeps any explicit caller override.
+export OPENCODE_CONFIG="${OPENCODE_CONFIG:-${cwd}/opencode.json}"
+
+info "rocbudai (dev) on $(hostname) (job ${SLURM_JOB_ID:-(not in alloc)})"
+info "model: ${ROCBUDAI_MODEL}   cwd: ${cwd}"
+
+OPENCODE_EXTRA_ARGS=()
+if [[ -n "$ROCBUDAI_SESSION" ]]; then
+    info "resuming session: ${ROCBUDAI_SESSION}"
+    OPENCODE_EXTRA_ARGS=(--session "${ROCBUDAI_SESSION}")
+elif [[ -n "$ROCBUDAI_CONTINUE" ]]; then
+    info "resuming last session"
+    OPENCODE_EXTRA_ARGS=(--continue)
+else
+    info "launching via: ollama launch opencode --model ${ROCBUDAI_MODEL}"
+    # Seed prompt = first user turn the model sees. opencode's `--prompt`
+    # is rendered as a visible user message in the chat history (there is
+    # no hidden / system-message injection in the TUI). We use the visible
+    # render to our advantage: the human staring at a freshly-allocated
+    # node during the cold-start window gets a polite "the model is warming
+    # up" notice and knows the TUI hasn't hung. The MODEL is told (via its
+    # persona's session-opening / FIRST-TURN rules) to treat this seed text
+    # purely as a session-opening trigger: do NOT echo / paraphrase /
+    # acknowledge it, do NOT narrate warm-up status — just emit the welcome
+    # banner + Q1/7. The container demo uses this SAME seed so the quick-test
+    # behaves exactly like a real session (the earlier hallucinated openings
+    # were caused by the persona not loading — fixed by the absolute
+    # instructions path above — not by the seed text).
+    ROCBUDAI_SEED_PROMPT="Waiting for the model to warm up — on a cold node this takes ~1 min for the first response. Hold on; the welcome banner and the first discovery question will appear once the model is ready."
+    OPENCODE_EXTRA_ARGS=(--prompt "${ROCBUDAI_SEED_PROMPT}")
+fi
+
+info "type /exit or Ctrl-D in the TUI to leave."
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    info "cold start: in container quick-test the first response can take a few minutes (a fresh model is loaded from a cold cache). It is a one-time cost — later prompts are fast."
+else
+    info "cold start: the first response can take ~1 min while the model warms up."
+fi
+echo
+
+# In the container quick-test the demo is fully user-paced: the user reads
+# the welcome, then types/accepts each suggested demo answer. The idle-timeout
+# auto-nudge does more harm than good there — a slow first response on a
+# freshly-loaded model trips the 120 s timer and injects "continue", which
+# derails a small demo model mid-interview (one of the reported failure
+# modes). Default the nudge OFF in the container (still overridable via
+# ROCBUDAI_NUDGE_DISABLE).
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    ROCBUDAI_NUDGE_DISABLE="${ROCBUDAI_NUDGE_DISABLE:-1}"
+fi
+
+# Auto-nudge watcher (out-of-process sidecar — see libexec/rocbudai-nudge-watcher
+# for the full design + heuristic). We pick a free ephemeral port via the
+# kernel (bind-then-let-watcher-reuse pattern is race-free for our needs
+# because opencode binds it immediately), pass it to opencode via --port,
+# AND give it to the watcher via env. Watcher exits when this script's PID
+# disappears. Disable per-session with: export ROCBUDAI_NUDGE_DISABLE=1.
+ROCBUDAI_OPENCODE_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || true)"
+ROCBUDAI_WATCHER_PID=""
+if [[ -n "$ROCBUDAI_OPENCODE_PORT" && "${ROCBUDAI_NUDGE_DISABLE:-0}" != "1" \
+      && -x "${ROCBUDAI_ROOT}/libexec/rocbudai-nudge-watcher" ]]; then
+    OPENCODE_EXTRA_ARGS+=(--port "$ROCBUDAI_OPENCODE_PORT")
+    ROCBUDAI_OPENCODE_PORT="$ROCBUDAI_OPENCODE_PORT" \
+    ROCBUDAI_WATCHER_PARENT_PID="$$" \
+        "${ROCBUDAI_ROOT}/libexec/rocbudai-nudge-watcher" </dev/null >/dev/null 2>&1 &
+    ROCBUDAI_WATCHER_PID="$!"
+    disown "$ROCBUDAI_WATCHER_PID" 2>/dev/null || true
+fi
+
+ollama launch opencode --model "${ROCBUDAI_MODEL}" -y -- "${OPENCODE_EXTRA_ARGS[@]}" || true
+
+# Watcher is parent-death-guarded but stop it eagerly on clean exit too,
+# so users don't see a stray python process in ps after /exit.
+if [[ -n "$ROCBUDAI_WATCHER_PID" ]]; then
+    kill -TERM "$ROCBUDAI_WATCHER_PID" 2>/dev/null || true
+fi
+
+# opencode prints a "Continue  opencode -s ses_<id>" panel after /exit which
+# would hang in our environment (no ollama on the login node, no Slurm
+# allocation, no module env). Wipe it; the rocBudAI banner below has the
+# right resume hints. Modern terminals retain the cleared content in
+# scrollback so users can look back at the session if they want to.
+clear || true
+
+# Post-session report.md validation -------------------------------------------
+#
+# Added after stress-test D-3 (2026-05-11). Validates the project-local
+# report.md against AGENTS.md §6 schema, surfaces structural issues to the
+# user at /exit so they find out before walking away. Pure read-only: never
+# writes, never blocks; if anything goes wrong (no python3, no report.md,
+# parse error) we silently move on to the banner. The same check is exposed
+# as an advisory step in rocbudai-doctor for re-running outside the session.
+_report_path="${cwd}/report.md"
+if [[ -f "$_report_path" ]] && command -v python3 >/dev/null 2>&1; then
+    _report_check_output="$(
+        REPORT="$_report_path" python3 - <<'PY' 2>/dev/null || true
+import os, re, sys
+try:
+    text = open(os.environ['REPORT']).read()
+except Exception:
+    sys.exit(0)
+
+lines = text.splitlines()
+issues = []
+
+# 1) Every "## Iteration NN" header is followed by body content within 10
+#    lines, not by another iteration header. Catches the "Iter 01 became
+#    empty when Iter 02 was inserted before its body" failure observed in
+#    D-3 finding #8.
+iter_hdr_re = re.compile(r'^## Iteration \d+', re.M)
+iter_hdrs = [(m.start(), m.group()) for m in iter_hdr_re.finditer(text)]
+for off, hdr in iter_hdrs:
+    line_no = text[:off].count('\n')
+    window = '\n'.join(lines[line_no + 1: line_no + 11]).strip()
+    # An empty body is bad; a body that *immediately* starts with another
+    # "## Iteration" header is the same failure (no content between).
+    if not window or window.startswith('## Iteration'):
+        issues.append(f'WARN: "{hdr}" at line {line_no+1} has empty body')
+
+# 2) Orphan content tail — text after the LAST "## Iteration NN" header
+#    that is far from EOF (>60 lines) suggests another iteration's body
+#    was pushed below this header by a partial Edit. Catches the
+#    "baseline body orphaned at EOF" half of D-3 finding #8 where the
+#    orphan content used bold (**Baseline**) rather than H2 headers, so
+#    a header-anchored detection would miss it.
+if iter_hdrs:
+    last_iter_off = iter_hdrs[-1][0]
+    last_iter_line = text[:last_iter_off].count('\n')
+    total_lines = len(lines)
+    lines_after_last_iter = total_lines - last_iter_line
+    # 80 lines is generous — a single iteration with prose, diffs, and
+    # tagged bullets should fit comfortably under that.
+    if lines_after_last_iter > 80:
+        issues.append(
+            f'WARN: {lines_after_last_iter} lines after the last iteration '
+            f'header (line {last_iter_line+1}) — possible orphan content '
+            f'from a partial Edit')
+
+# 3) Files-modified table — if there are iterations, the table should
+#    have at least one row. Catches the case where the agent forgot to
+#    update the audit trail (AGENTS.md §1 rule 10).
+if iter_hdrs and '## Files modified this session' in text:
+    fm_body = text.split('## Files modified this session', 1)[1].split('\n## ', 1)[0]
+    rows = [l for l in fm_body.splitlines()
+            if l.startswith('| /') or l.startswith('| ~')]
+    if not rows:
+        issues.append('WARN: Files-modified table is empty but iterations exist')
+
+# 4) [FACT] numeric claims should carry a unit (us / ms / s / GB/s / etc.).
+#    Catches stripped-unit drift between chat and report (e.g. "1.7" without
+#    "x"). Soft check — limit to a count, not per-line. Known dimensionless
+#    quantities (residue, iteration count, ratios) are excluded so they
+#    don't false-positive every session.
+fact_lines = [l for l in lines if '[FACT]' in l]
+dimensionless_re = re.compile(
+    r'residue|iter(ations?|s)?\b|count|ratio|fraction|factor|index|rank',
+    re.I)
+unit_re = re.compile(
+    r'\d+(?:\.\d+)?\s*(?:µs|us|ms|ns|s\b|x\b|×|GB/s|TB/s|MB/s|KB/s|'
+    r'GFLOPS|TFLOPS|MB|GB|KB|TB|%)')
+big_num_re = re.compile(r'\d+\.\d|\d{2,}')
+unitless = [l for l in fact_lines
+            if big_num_re.search(l)
+            and not unit_re.search(l)
+            and not dimensionless_re.search(l)]
+if len(unitless) >= 3:
+    issues.append(f'WARN: {len(unitless)} [FACT] line(s) carry numbers without unit suffix')
+
+print(f'iterations={len(iter_hdrs)} issues={len(issues)}')
+for i in issues:
+    print(f'    {i}')
+PY
+)"
+
+    if [[ -n "$_report_check_output" ]]; then
+        echo "──────────────────────────────────────────────────────────"
+        echo "  report.md check (AGENTS.md §6 schema)"
+        echo "  ${_report_path}"
+        # Indent each line of the python output for readability.
+        echo "$_report_check_output" | sed 's/^/    /'
+        # If there were issues, point at the re-runnable doctor check.
+        if echo "$_report_check_output" | grep -q '^    WARN:'; then
+            echo "  re-run this check any time:  rocbudai-doctor"
+        fi
+    fi
+fi
+
+echo "──────────────────────────────────────────────────────────"
+echo "  rocBudAI session ended."
+echo ""
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    # In the container the `rocbudai` wrapper refuses to run (it requires a
+    # SLURM_JOB_ID, which the container does not inherit), so point users at
+    # `rocbudai-tui` directly. You are already in the working dir below.
+    echo "  You are back in: ${_ROCBUDAI_CWD_FULL}"
+    echo ""
+    echo "  Resume this session:       rocbudai-tui --continue"
+    echo "  Start fresh:               rocbudai-tui"
+    echo "  (run from this same directory so the session picker finds it)"
+else
+    echo "  Resume last session:       rocbudai --continue"
+    echo "  Start fresh:               rocbudai"
+fi
+echo "──────────────────────────────────────────────────────────"

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# rocbudai-name-session — record a human-readable name for the current session.
+#
+# Called by the rocBudAI agent during the discovery interview's Q1/7 to
+# associate a short, user-given name with the active opencode session id.
+# The name is stored in `./.rocbudai-sessions.json` (project-scoped) so that
+# the `module load rocbudai` session picker can show it next time the user
+# comes back to this project dir.
+#
+# USAGE
+#   rocbudai-name-session "<name>"        # record name for the active session
+#   rocbudai-name-session --get <id>      # print recorded name for a session id
+#   rocbudai-name-session --list          # print id<TAB>name for this dir
+#
+# BEHAVIOUR
+#   Active session is resolved as the most recently updated opencode session
+#   whose `directory` field equals `pwd`. That is correct during the discovery
+#   interview (it is the session opencode just opened in this cwd). For the
+#   pathological case where the agent calls this helper after several
+#   distinct rocbudai sessions have been created in the same dir without
+#   updates, set ROCBUDAI_SESSION_ID=<id> in the environment to disambiguate.
+#
+# EXIT CODES
+#   0  success
+#   1  no matching session found / no name recorded for --get
+#   2  bad usage / empty name
+
+set -euo pipefail
+
+ROCBUDAI_OPENCODE_BIN="${ROCBUDAI_OPENCODE_BIN:-/shared/apps/ubuntu/opt/opencode/1.14.28/opencode}"
+SIDECAR=".rocbudai-sessions.json"
+
+err()  { echo "[rocbudai-name-session] error: $*" >&2; }
+info() { echo "[rocbudai-name-session] $*"; }
+
+usage() {
+    cat <<'EOF'
+usage:
+  rocbudai-name-session "<name>"        # record name for the active session
+  rocbudai-name-session --get <id>      # print recorded name for a session id
+  rocbudai-name-session --list          # print "id<TAB>name" for this dir
+EOF
+}
+
+[[ $# -lt 1 ]] && { usage >&2; exit 2; }
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+
+    --get)
+        [[ $# -eq 2 ]] || usage
+        SID="$2" SIDECAR="$SIDECAR" python3 - <<'PY'
+import json, os, sys
+sf = os.environ['SIDECAR']
+sid = os.environ['SID']
+if not os.path.exists(sf):
+    sys.exit(1)
+try:
+    d = json.load(open(sf))
+except Exception:
+    sys.exit(1)
+name = d.get(sid, {}).get('name')
+if not name:
+    sys.exit(1)
+print(name)
+PY
+        ;;
+
+    --list)
+        [[ -f "$SIDECAR" ]] || exit 0
+        SIDECAR="$SIDECAR" python3 - <<'PY'
+import json, os
+sf = os.environ['SIDECAR']
+try:
+    d = json.load(open(sf))
+except Exception:
+    raise SystemExit(0)
+rows = sorted(
+    d.items(),
+    key=lambda kv: -kv[1].get('last_active', 0),
+)
+for sid, entry in rows:
+    name = entry.get('name', '')
+    print(f"{sid}\t{name}")
+PY
+        ;;
+
+    *)
+        NAME="$1"
+        [[ -z "$NAME" ]] && { err "name cannot be empty"; exit 2; }
+
+        SESSIONS_JSON="$("$ROCBUDAI_OPENCODE_BIN" session list --format json 2>/dev/null || echo '[]')"
+
+        # Allow ROCBUDAI_SESSION_ID override; otherwise pick most-recently-updated
+        # session whose directory == cwd.
+        # NOTE: data is passed via env var (not stdin) because a heredoc on
+        # `python3 -` redirects stdin to the heredoc body, discarding any
+        # piped input.
+        SID="${ROCBUDAI_SESSION_ID:-}"
+        if [[ -z "$SID" ]]; then
+            SID="$(SESSIONS_JSON="$SESSIONS_JSON" CWD="$(pwd)" python3 - <<'PY'
+import json, os, sys
+try:
+    sessions = json.loads(os.environ.get('SESSIONS_JSON') or '[]')
+except Exception:
+    sessions = []
+cwd = os.environ['CWD']
+matches = [x for x in sessions if x.get('directory') == cwd]
+matches.sort(key=lambda x: -x.get('updated', 0))
+if matches:
+    print(matches[0]['id'])
+PY
+            )"
+        fi
+
+        if [[ -z "$SID" ]]; then
+            err "no opencode session found for cwd $(pwd) — is the TUI running here?"
+            exit 1
+        fi
+
+        SID="$SID" NAME="$NAME" SIDECAR="$SIDECAR" python3 - <<'PY'
+import json, os, time
+sf   = os.environ['SIDECAR']
+sid  = os.environ['SID']
+name = os.environ['NAME']
+try:
+    d = json.load(open(sf))
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+now = int(time.time())
+entry = d.get(sid, {})
+entry['name']        = name
+entry.setdefault('created', now)
+entry['last_active'] = now
+d[sid] = entry
+with open(sf, 'w') as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+    f.write('\n')
+PY
+
+        info "recorded name '$NAME' for session $SID in $(pwd)/$SIDECAR"
+        ;;
+esac

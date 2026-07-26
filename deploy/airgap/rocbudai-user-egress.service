@@ -1,0 +1,24 @@
+# /etc/systemd/system/rocbudai-user-egress.service
+#
+# rocBudAI Phase A.2 — load per-user-UID egress nft skeleton at boot.
+#
+# Mirrors ollama-egress.service. The .nft file pre-declares an empty
+# `inet rocbudai_user_egress` table; the Slurm prolog/epilog add and
+# remove per-job rules into it for `--comment=ollama` allocations.
+
+[Unit]
+Description=rocBudAI per-user-UID egress nft skeleton (Phase A.2)
+After=nftables.service network-pre.target
+Wants=nftables.service
+ConditionPathExists=/etc/nftables.d/rocbudai-user-egress.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/rocbudai-user-egress.nft
+ExecStop=/usr/sbin/nft delete table inet rocbudai_user_egress
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=rocBudAI — watch the KB inputs dir for changes
+Documentation=man:rocbudai(1)
+# Cooperating units:
+#   rocbudai-ingest-inputs.service  (oneshot, runs the converter)
+#   rocbudai-ingest-inputs.timer    (fallback hourly sweep, see notes)
+#
+# Trigger model: PathChanged fires on IN_CLOSE_WRITE for any file in the
+# watched directory. systemd.path is non-recursive and the KB is flat
+# today (no subdirs in /shareddata/rocbudai/docs/inputs/), so a single
+# PathChanged= line is sufficient. If subdirs are introduced later, add
+# more PathChanged= lines (one per subdir) or switch to PathExistsGlob.
+#
+# NFS caveat: inotify only sees changes made on THIS host. Admins drop
+# PDFs by `scp` / `cp` to the login node, so the common-case is
+# covered. The timer unit (hourly) catches the edge case where a PDF
+# arrives via a non-login-node mount.
+
+[Path]
+PathChanged=/shareddata/rocbudai/docs/inputs
+
+[Install]
+WantedBy=multi-user.target

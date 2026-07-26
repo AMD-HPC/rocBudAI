@@ -1,0 +1,32 @@
+#!/usr/sbin/nft -f
+#
+# /etc/nftables.d/ollama-acl.nft — rocBudAI Phase 3.5 layer 2.
+#
+# Allows only UID 0 (root) and UID 997 (ollama) to connect to the
+# real ollama daemon at 127.0.0.1:11435. Everyone else is rejected
+# with a TCP RST so they get a clean "connection refused" instead of
+# hanging.
+#
+# The ollama-proxy on :11434 (running as UID 997) is what end-users
+# hit; it forwards safe inference endpoints and rejects mutation
+# endpoints. So a regular user CAN do inference (via the proxy on
+# :11434), they just can't talk to the raw daemon.
+#
+# Admin escape hatch: `sudo OLLAMA_HOST=127.0.0.1:11435 ollama-real …`
+# (the sudo gives UID 0, which the rule allows).
+
+# Idempotent install: declare the table empty first, flush it, then
+# add the rule. Works even on first run (the empty add is a no-op).
+table inet ollama_acl { }
+flush table inet ollama_acl
+
+table inet ollama_acl {
+    chain output {
+        type filter hook output priority filter; policy accept;
+
+        ip daddr 127.0.0.1 tcp dport 11435 \
+            meta skuid != { 0, 997 } \
+            reject with tcp reset \
+            comment "rocBudAI: only root/ollama can hit the raw ollama daemon"
+    }
+}

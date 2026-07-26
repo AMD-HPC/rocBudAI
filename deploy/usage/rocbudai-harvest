@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file or at https://opensource.org/licenses/MIT.
+# /etc/cron.daily/rocbudai-harvest — daily rocBudAI usage rollup.
+#
+# Runs once per day via cron.daily (~06:25 local on Debian/Ubuntu via
+# anacron). Scopes to YESTERDAY (00:00–24:00 local). Appends one JSONL
+# row per (date, user) to /var/log/rocbudai-usage.jsonl.
+#
+# Privacy posture:
+#   - root-only file (0600 root:root).
+#   - No prompts, no responses, no source paths, no report.md contents.
+#   - Only counters and timestamps. Row size is bounded by structure
+#     (~250 bytes); rocbudai-airgap-check --deep can spot-check this.
+#
+# Sources (no instrumentation in rocbudai itself required):
+#   sacct                                          → allocations, durations, exit state
+#   <home>/rocbudai-runs/<ts>/                     → session activity
+#   <home>/rocbudai-runs/<ts>/report.md            → did the agent do real work
+#   <home>/rocbudai-runs/<ts>/.rocbudai-sessions.json → did discovery start
+#
+# Manual re-run for a specific date:
+#   /etc/cron.daily/rocbudai-harvest 2026-05-05
+# (Re-running appends duplicate rows for that date; de-dupe by (date,user)
+# downstream if you backfill.)
+
+set -euo pipefail
+
+LOG="${ROCBUDAI_USAGE_LOG:-/var/log/rocbudai-usage.jsonl}"
+DATE="${1:-$(date -d 'yesterday' +%F)}"
+START="${DATE}T00:00:00"
+END="$(date -d "${DATE} +1 day" +%F)T00:00:00"
+START_EPOCH="$(date -d "$START" +%s)"
+END_EPOCH="$(  date -d "$END"   +%s)"
+
+umask 077
+touch "$LOG"
+chown root:root "$LOG" 2>/dev/null || true
+chmod 0600 "$LOG"
+
+# 1. Pull all rocbudai-tagged allocations for this date.
+sacct_out="$(
+    sacct -aX -S "$START" -E "$END" \
+          -o User,Account,Comment,ElapsedRaw,State \
+          --parsable2 --noheader 2>/dev/null \
+    | awk -F'|' 'tolower($3) ~ /ollama/'
+)"
+[[ -z "$sacct_out" ]] && exit 0
+
+users="$(echo "$sacct_out" | awk -F'|' '{print $1}' | sort -u)"
+
+emit_row() {
+    DATE="$1" USER_="$2" ACCOUNT="$3" \
+    N_ALLOC="$4" TOTAL_MIN="$5" CLEAN_RATE="$6" \
+    N_NAMED="$7" N_REPORT="$8" REPORT_BYTES="$9" N_RETURNED="${10}" \
+    python3 - <<'PY' >> "$LOG"
+import json, os
+print(json.dumps({
+    "event":                 "daily_usage",
+    "date":                  os.environ["DATE"],
+    "user":                  os.environ["USER_"],
+    "account":               os.environ["ACCOUNT"],
+    "n_allocations":         int(os.environ["N_ALLOC"]),
+    "total_minutes":         int(os.environ["TOTAL_MIN"]),
+    "clean_exit_rate":       float(os.environ["CLEAN_RATE"]),
+    "n_sessions_named":      int(os.environ["N_NAMED"]),
+    "n_sessions_with_report":int(os.environ["N_REPORT"]),
+    "report_bytes_total":    int(os.environ["REPORT_BYTES"]),
+    "returned_via_continue": int(os.environ["N_RETURNED"]),
+}))
+PY
+}
+
+for user in $users; do
+    home="$(getent passwd "$user" | cut -d: -f6)"
+    # Trust whatever getent reports as the user's home (sites vary:
+    # /home/<u>, /shared/prerelease/home/<u>, etc). Only skip if the
+    # account has no resolvable home dir at all.
+    [[ -z "$home" || ! -d "$home" ]] && continue
+
+    rows="$(echo "$sacct_out" | awk -F'|' -v u="$user" '$1==u')"
+    n_alloc="$(echo "$rows" | wc -l)"
+    total_s="$(echo "$rows" | awk -F'|' '{s+=$4} END{print s+0}')"
+    clean="$( echo "$rows" | awk -F'|' '$5=="COMPLETED"' | wc -l)"
+    clean_rate="$(awk -v c="$clean" -v n="$n_alloc" \
+                  'BEGIN{printf "%.2f", (n>0?c/n:0)}')"
+    total_min=$(( total_s / 60 ))
+    account="$(echo "$rows" | head -1 | awk -F'|' '{print $2}')"
+
+    # Per-session metrics. Source: the user's opencode SQLite DB at
+    # ~/.local/share/opencode/opencode.db. The `session` table records
+    # every opencode session with its project `directory`, `time_created`,
+    # and `time_updated` (ms since epoch). One read-only query (~0.1s)
+    # replaces a recursive home walk that was minutes on real homes.
+    #
+    # Cross-reference semantics: we only enter this block for users
+    # `sacct` shows had a --comment=ollama allocation yesterday, which
+    # filters out admin's `sudo -i -u <user>` debug sessions (those go
+    # into <user>'s opencode DB but are owned by admin in Slurm and are
+    # therefore not picked up as <user>'s usage).
+    metrics="$(USER_HOME="$home" \
+               START_EPOCH="$START_EPOCH" END_EPOCH="$END_EPOCH" \
+               python3 - <<'PY' 2>/dev/null
+import json, os, sqlite3
+db = os.path.join(os.environ["USER_HOME"],
+                  ".local/share/opencode/opencode.db")
+if not os.path.exists(db):
+    print("0|0|0|0"); raise SystemExit
+start_ms = int(os.environ["START_EPOCH"]) * 1000
+end_ms   = int(os.environ["END_EPOCH"])   * 1000
+try:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    sessions = list(con.execute("""
+        SELECT id, directory, time_created, time_updated
+        FROM session
+        WHERE time_updated >= ? AND time_updated < ?
+    """, (start_ms, end_ms)))
+except Exception:
+    print("0|0|0|0"); raise SystemExit
+n_returned = sum(1 for s in sessions if s[2] < start_ms)
+n_named = 0
+seen_dirs = set()
+n_report = 0
+report_bytes = 0
+for sid, d, _tc, _tu in sessions:
+    sidecar = os.path.join(d, ".rocbudai-sessions.json")
+    if os.path.exists(sidecar):
+        try:
+            data = json.load(open(sidecar))
+            if isinstance(data, dict) and data.get(sid, {}).get("name"):
+                n_named += 1
+        except Exception:
+            pass
+    if d in seen_dirs:
+        continue
+    seen_dirs.add(d)
+    rep = os.path.join(d, "report.md")
+    if os.path.exists(rep):
+        n_report += 1
+        try:
+            report_bytes += os.path.getsize(rep)
+        except OSError:
+            pass
+print(f"{n_named}|{n_report}|{report_bytes}|{n_returned}")
+PY
+)"
+    metrics="${metrics:-0|0|0|0}"
+    n_named="$(   echo "$metrics" | awk -F'|' '{print $1}')"
+    n_report="$(  echo "$metrics" | awk -F'|' '{print $2}')"
+    report_bytes="$(echo "$metrics" | awk -F'|' '{print $3}')"
+    n_returned="$( echo "$metrics" | awk -F'|' '{print $4}')"
+
+    emit_row "$DATE" "$user" "$account" \
+             "$n_alloc" "$total_min" "$clean_rate" \
+             "$n_named" "$n_report" "$report_bytes" "$n_returned"
+done
+
+# Hand off to the watchdog so today's harvest is verified before we exit.
+# The probe writes its own one-line "hygiene_check" row into the same
+# JSONL, so an AI tool parsing the file sees both daily_usage rows AND
+# the watchdog's verdict in a single stream — no syslog needed.
+PROBE="${ROCBUDAI_AIRGAP_PROBE:-/usr/local/sbin/rocbudai-airgap-probe}"
+[[ -x "$PROBE" ]] && "$PROBE" || true
+
+exit 0

@@ -1,0 +1,37 @@
+# /etc/nftables.d/rocbudai-user-egress.nft
+#
+# rocBudAI Phase A.2 — boot-time skeleton for per-user-UID egress block.
+#
+# Loaded once per boot by /etc/systemd/system/rocbudai-user-egress.service.
+# Declares an empty `inet rocbudai_user_egress` table with a single
+# output chain hooked at filter priority. Per-job rules are added to this
+# table by the egress prolog drop-in (and removed by the epilog drop-in):
+#
+#     deploy/comment-gating/rocbudai-egress-prolog.sh
+#     deploy/comment-gating/rocbudai-egress-epilog.sh
+#
+# This file is intentionally rule-free at boot — having the table
+# pre-declared gives the prolog a fixed target to add chains into.
+# When no --comment=ollama jobs are running, this table is empty and
+# has no effect on traffic. A reboot of a node with active jobs would
+# lose the per-job rules, which is correct (jobs are also gone after
+# a node reboot).
+#
+# Idempotent: safe to load repeatedly; flushes its own table first.
+#
+# Rollback: `sudo systemctl stop rocbudai-user-egress.service` removes
+# the entire table; the running daemons are unaffected since the table
+# uses owner-match (only restricted UIDs see any rules).
+
+table inet rocbudai_user_egress { }
+flush table inet rocbudai_user_egress
+
+table inet rocbudai_user_egress {
+    chain output {
+        type filter hook output priority filter; policy accept;
+        # No rules at boot. The prolog inserts a per-job jump rule
+        # here when an --comment=ollama job starts; the epilog
+        # removes it. Per-job chains live in this same table and are
+        # named `job_<SLURM_JOB_ID>`.
+    }
+}

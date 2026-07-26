@@ -1,0 +1,36 @@
+# /etc/nftables.d/ollama-egress.nft
+#
+# rocBudAI Phase 5b — block ollama UID egress to non-cluster destinations.
+#
+# Loaded by /etc/systemd/system/ollama-egress.service.
+# Companion to ollama-acl.nft (which is the inbound :11435 firewall).
+#
+# Idempotent: safe to load repeatedly; flushes its own table first.
+
+table inet ollama_egress { }
+flush table inet ollama_egress
+
+table inet ollama_egress {
+    chain output {
+        type filter hook output priority filter; policy accept;
+
+        # Match the ollama user by NAME — nft resolves it to the UID at load
+        # time, so these rules are portable regardless of the numeric UID.
+        # (The 'ollama' user must exist when this ruleset is loaded.)
+
+        # Loopback — proxy ↔ daemon, systemd-resolved, etc. MANDATORY first.
+        meta skuid "ollama" oif "lo" accept
+
+        # Cluster-internal RFC1918 traffic (NFS, Slurm, monitoring — and the
+        # site DNS resolver, which on an HPC cluster lives in RFC1918, so this
+        # also permits DNS). If your resolver is on a public IP, add an
+        # explicit accept for it above this block.
+        meta skuid "ollama" ip daddr 10.0.0.0/8     accept
+        meta skuid "ollama" ip daddr 172.16.0.0/12  accept
+        meta skuid "ollama" ip daddr 192.168.0.0/16 accept
+
+        # Everything else from the ollama UID — reject.
+        meta skuid "ollama" reject with icmpx type admin-prohibited \
+            comment "rocBudAI Phase 5: ollama UID egress blocked"
+    }
+}
