@@ -699,8 +699,8 @@ Examples:
 \fB# Default: 4 reps with quiescence guard, 3-rep median.\fR
 rocbudai\-bench \-\- ./my_app
 
-\fB# 6 reps for a noisy benchmark.\fR
-rocbudai\-bench \-n 6 \-\- mpirun \-np 4 ./solver
+\fB# 6 reps for a noisy single\-GPU benchmark.\fR
+rocbudai\-bench \-n 6 \-\- ./my_app
 
 \fB# Skip quiescence on a node where you fully own the GPU.\fR
 rocbudai\-bench \-\-no\-wait \-\- ./isolated_run
@@ -716,6 +716,21 @@ sub\-paragraph).
 The same helper is available to you on the command line for
 hand\-checking the agent's numbers or for running benchmarks outside
 the rocBudAI session.
+.PP
+Multi\-rank or multi\-GPU FOMs use a sibling helper, \fBrocbudai\-submit\fR,
+which runs the command on a dedicated multi\-GPU Slurm allocation (one
+rank per GPU) and returns the same median/\fB[FACT]\fR summary:
+.PP
+.RS 4
+.nf
+\fBrocbudai\-submit \-\-gpus N \-\- mpirun \-np N ./solver\fR
+.fi
+.RE
+.PP
+The submit partition comes from \fBROCBUDAI_SUBMIT_PARTITION\fR or \fB\-p\fR,
+else the cluster default partition; its GPUs may be smaller partitioned
+slices than the bench APU, so treat that number as a separate baseline,
+not comparable to the single\-GPU \fBrocbudai\-bench\fR value.
 .PP
 For the in\-script reference (rationale, exit codes, defaults), run:
 .PP

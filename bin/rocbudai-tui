@@ -255,8 +255,9 @@ fi
 # agent for non-GPU work (e.g. CPU profiling, build-system advice), so
 # missing GPUs are non-fatal here. rocbudai-doctor surfaces the count.
 if command -v rocm-smi >/dev/null 2>&1; then
-    if ! rocm-smi --showid >/dev/null 2>&1; then
-        warn "rocm-smi present but cannot enumerate GPUs."
+    if ! timeout 8 rocm-smi --showid >/dev/null 2>&1; then
+        warn "rocm-smi present but could not enumerate GPUs within 8s."
+        warn "the GPU may be wedged (check dmesg for 'SMU is in hanged state')"
         warn "is this node in CPX mode? (rocBudAI requires SPX)"
         warn "for full diagnostics:  rocbudai-doctor"
     fi
@@ -874,6 +875,56 @@ if [[ "${ROCBUDAI_CWD_AUTOCREATED}" == "1" ]]; then
     _ROCBUDAI_BANNER_AUTOLINE=$'\n               (auto-created from $HOME — files persist after logout)'
 fi
 
+# Permission-mode-aware banner text. ROCBUDAI_PERMISSION_MODE (set above from
+# ROCBUDAI_AUTORUN) is the policy the opencode.json we just wrote actually
+# enforces, so the banner must reflect it rather than a hard-coded "ASK mode"
+# string. _SHORT feeds the container banner, _FULL the cluster banner. The
+# single-quoted heredocs keep $HOME / backticks literal; they are embedded via
+# ${...} into the outer banner heredocs, whose expansion is not re-scanned.
+if [[ "${ROCBUDAI_PERMISSION_MODE}" == "AUTO-RUN" ]]; then
+    IFS= read -r -d '' _ROCBUDAI_BANNER_PERM_SHORT <<'PERM_EOF' || true
+I am running in AUTO-RUN mode: I run commands without pausing for per-command
+approval. Dangerous patterns (rm -rf of key paths, mkfs, shutdown/reboot,
+systemctl/service, module purge/reset) stay hard-denied; sudo, dd and scancel
+still ask.
+PERM_EOF
+    IFS= read -r -d '' _ROCBUDAI_BANNER_PERM_FULL <<'PERM_EOF' || true
+I am running in AUTO-RUN mode. I will run bash commands and make file edits
+without pausing for your approval. The exceptions: a hard denylist stays
+blocked (rm -rf of /, $HOME, /etc, /usr, /opt, /var, /shared...; mkfs;
+shutdown/reboot; systemctl/service; module purge/reset), and sudo, dd and
+scancel still stop to ask you first.
+
+To switch to ASK mode (per-command approval), type /exit, then run:
+
+    unset ROCBUDAI_AUTORUN            # or: export ROCBUDAI_AUTORUN=0
+    module load rocbudai
+PERM_EOF
+else
+    IFS= read -r -d '' _ROCBUDAI_BANNER_PERM_SHORT <<'PERM_EOF' || true
+I am running in ASK mode: I pause for your y/Enter approval before any
+non-trivial command; read-only commands (ls, cat, rocminfo, rocm-smi) run
+without nagging.
+PERM_EOF
+    IFS= read -r -d '' _ROCBUDAI_BANNER_PERM_FULL <<'PERM_EOF' || true
+I am running in ASK mode (the default). Every non-trivial bash command
+I want to run will pause and wait for your y/Enter approval. Read-only
+commands like ls, cat, module list, rocm-smi, and rocminfo are
+pre-approved so I do not nag you for trivial introspection.
+
+If you would rather have me run everything without prompts (auto-run
+mode), type /exit, then run:
+
+    export ROCBUDAI_AUTORUN=1
+    module load rocbudai
+
+To go back to ASK mode:  `unset ROCBUDAI_AUTORUN; module load rocbudai`
+(or `export ROCBUDAI_AUTORUN=0; module load rocbudai`).
+PERM_EOF
+fi
+_ROCBUDAI_BANNER_PERM_SHORT="${_ROCBUDAI_BANNER_PERM_SHORT%$'\n'}"
+_ROCBUDAI_BANNER_PERM_FULL="${_ROCBUDAI_BANNER_PERM_FULL%$'\n'}"
+
 if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
     # Container quick-test banner. No Slurm/partition/module concepts apply
     # here, so the cluster banner's --comment / `module load rocbudai`
@@ -896,9 +947,7 @@ This is a CONTAINER quick-test (testing only): ROCm is preinstalled, there
 are no Lmod modules, and the LLM and your code share the GPU. We start from
 the HIP saxpy example so you can watch the whole flow on a tiny kernel.
 
-I am running in ASK mode: I pause for your y/Enter approval before any
-non-trivial command; read-only commands (ls, cat, rocminfo, rocm-smi) run
-without nagging.
+${_ROCBUDAI_BANNER_PERM_SHORT}
 
 Auto-nudge: if a turn ends and we sit idle for 240 s, I'll inject a
 "continue" myself so we don't both wait. It shows up in the transcript.
@@ -923,19 +972,7 @@ Session info:
 Privacy: your code, chats, and model responses stay on this node while
 this job runs. Verify: rocbudai-airgap-check
 
-I am running in ASK mode (the default). Every non-trivial bash command
-I want to run will pause and wait for your y/Enter approval. Read-only
-commands like ls, cat, module list, rocm-smi, and rocminfo are
-pre-approved so I do not nag you for trivial introspection.
-
-If you would rather have me run everything without prompts (auto-run
-mode), type /exit, then run:
-
-    export ROCBUDAI_AUTORUN=1
-    module load rocbudai
-
-To go back to ASK mode:  \`unset ROCBUDAI_AUTORUN; module load rocbudai\`
-(or \`export ROCBUDAI_AUTORUN=0; module load rocbudai\`).
+${_ROCBUDAI_BANNER_PERM_FULL}
 
 Auto-nudge: if a turn ends and the session stays idle for 240 s, I'll
 inject a "continue" myself so we don't both sit there waiting. The

@@ -31,6 +31,11 @@ MODEL_NAME="qwen3.5:122b"
 # only; sliced CPX/TPX make the runner abort). "" disables the partition gate.
 SPX_PARTITIONS="PPAC_MI300A_SPX"
 
+# Slurm partition for rocbudai-submit's multi-rank / multi-GPU benchmark
+# jobs (e.g. a CPX/GPU-sliced partition with several GPUs). "" => the
+# cluster default partition. Override per run with `rocbudai-submit -p`.
+SUBMIT_PARTITION=""
+
 # --- step-8 hardening paths (only used by the matching --with-* feature) ----
 # Slurm site prolog/epilog root. --with-comment-gating installs the drop-ins
 # under ${SLURMSCRIPTS_DIR}/{prolog.d,epilog.d}.

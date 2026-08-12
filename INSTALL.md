@@ -272,6 +272,7 @@ Key settings:
   exclusively for `rocbudai-bench`** so the in-session FOM is free of
   inference contention. `rocbudai-bench` owns GPU 3 + cores
   72-95,168-191.
+- **Multi-GPU / MPI FOMs** use `rocbudai-submit` instead of the in-node bench GPU: it runs the multi-rank command on a separate Slurm GPU allocation (partition from `SUBMIT_PARTITION` / `ROCBUDAI_SUBMIT_PARTITION` / `-p`, else the cluster default) and returns the same median/[FACT] summary.
 - `OLLAMA_SCHED_SPREAD=1` — spread the model across the visible GPUs
   (now the three fenced dies 0,1,2; essential when the model exceeds a
   single die's VRAM).

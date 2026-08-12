@@ -487,7 +487,7 @@ Login-node only (NOT in the chroot — these run on the user's entry host):
 - **Dedicated bench GPU**: ollama + the agent are fenced onto the available GPUs
   0,1,2,.. (`ROCR_VISIBLE_DEVICES=0,1,2,..` + `AllowedCPUs=...` in
   `ollama.service`), leaving **one GPU reserved for `rocbudai-bench`** so
-  the in-session FOM is free of inference contention. With three dies
+  the in-session FOM is free of inference contention. Single-GPU FOMs use `rocbudai-bench` on that reserved GPU; multi-rank / multi-GPU FOMs use `rocbudai-submit`, which offloads to a separate Slurm GPU allocation (same median/[FACT] summary). With three dies
   for the daemon, `OLLAMA_MAX_LOADED_MODELS=1` keeps exactly one model
   resident; the prolog pre-warms only the default (`qwen3.5:122b`), and
   opt-in models cold-load on demand.

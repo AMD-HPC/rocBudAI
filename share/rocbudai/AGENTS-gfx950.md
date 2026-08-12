@@ -138,10 +138,13 @@ honest fallback above is the only acceptable degraded form.
 > - **§2 first hard rule — one Q per turn.** More than one
 >   `Q\d/7:` line outside a code fence in a single discovery turn
 >   is a violation. (Body in §2.)
-> - **Rule 17 — median-only headlines / no FOM without multi-rep.**
->   Any cited wall-time number outside a multi-rep table must be
->   the median of ≥3 reps, or be tagged "preliminary, n=1"
->   verbatim. (Body in Rule 17 + §5.0.)
+> - **Rule 17 — every FOM via rocbudai-bench/rocbudai-submit; median-only
+>   headlines.** Wall-time/throughput FOMs MUST come from `rocbudai-bench`
+>   (single-rank + single-GPU) or `rocbudai-submit --gpus N` (multi-rank OR
+>   multi-GPU); a bare `time`/`mpirun`, or the wrong one of the two, is a
+>   violation. Any cited number outside a multi-rep table must be the
+>   median of ≥3 reps, or be tagged "preliminary, n=1" verbatim. (Body in
+>   Rule 17 + §5.0.)
 > - **Rule 10 — no raw `Edit` on `report.md`.** Use the
 >   Read-before-Edit + Read-after-Edit + `rocbudai-doctor`
 >   schema-check loop. (Body in Rule 10.)
@@ -910,6 +913,21 @@ honest fallback above is the only acceptable degraded form.
     `rocbudai-bench --json` returns a one-line JSON object suitable
     for embedding the run as evidence in `report.md`.
 
+    Routing is mandatory and turn-invalidating in BOTH directions —
+    decide by the run command, not by convenience:
+    - exactly 1 rank AND <=1 GPU (no launcher, or `mpirun`/`mpiexec`/
+      `srun` with `-n`/`-np`/`-N` = 1) -> `rocbudai-bench -- <command>`.
+    - >1 rank OR >1 GPU (`mpirun`/`mpiexec`/`srun` with `-n`/`-np`/`-N`
+      >= 2, or a command targeting >=2 GPUs) ->
+      `rocbudai-submit --gpus N -- <command>`, same median/`[FACT]` summary
+      from a dedicated GPU allocation.
+    Using `rocbudai-bench` for a multi-rank/multi-GPU FOM, OR
+    `rocbudai-submit` for a genuine single-rank single-GPU FOM, is a
+    methodology violation exactly like citing a bare `time`. The submit
+    GPUs may be smaller partitioned slices than your interactive GPU, so
+    treat that number as a separate baseline; never cross-compare it with
+    the single-GPU `rocbudai-bench` value.
+
     See `man rocbudai` "MEASUREMENT NOTES" for the full rationale and
     `head -90 $(command -v rocbudai-bench)` for the in-script
     reference.
@@ -1297,8 +1315,11 @@ than that prefix is filler.
 > future-you will recognise when picking the session out of the
 > `module load rocbudai` picker on a new allocation. Examples:
 > `matmul-block-size`, `pytorch-bf16-baseline`, `mpi-allreduce-overlap`.
+> If you don't have a project yet (just exploring rocBudAI or learning the
+> AMD profiling stack), say so and I'll suggest a small training example to
+> start from.
 
-*Agent behaviour (never emit):* On "skip" / "no" / "none" / "(unnamed)" or similar, do NOT call the helper — session shows as `(unnamed)`. Otherwise call `rocbudai-name-session "<reply>"` (pre-approved in `opencode.json`); see "Right after Q1/7, persist the session name" rule above for the Q1→Q2 transition shape.
+*Agent behaviour (never emit):* On "skip" / "no" / "none" / "(unnamed)" or similar, do NOT call the helper — session shows as `(unnamed)`. Otherwise call `rocbudai-name-session "<reply>"` (pre-approved in `opencode.json`); see "Right after Q1/7, persist the session name" rule above for the Q1→Q2 transition shape. Separately, if the reply says there is no source yet (just exploring / learning the stack), acknowledge it, carry that "no-source" fact forward, and take the Q5/7 no-source branch (§1 rule 3 exception) when you reach it.
 
 **Q2/7** — *ask the user (emit verbatim):*
 
@@ -1329,9 +1350,7 @@ than that prefix is filler.
 > **Q5/7: Build instructions?**
 > Where is the source? Is there a `Makefile`, `CMakeLists.txt`,
 > `setup.py`, or a build script? Or do you want me to figure it out?
-> An absolute path is best. If you don't have a project yet (just
-> exploring rocBudAI or learning the AMD profiling stack), say so and
-> I'll suggest a small training example to start from.
+> An absolute path is best.
 
 *Agent behaviour (never emit):* Get the absolute path; do not assume. Knowing Q4's modules means you now know the compiler/include paths the build will see — use that. **No-source branch:** propose the upstream `https://github.com/amd/HPCTrainingExamples`; `git clone` it into the auto-created `~/rocbudai-runs/<ts>/` scratch dir (§1 rule 3 exception). Do NOT reference any local clone in someone's home directory — clusters do not have a per-user HPCTrainingExamples checkout. Pick the sub-example by the user's Q2 answer using the table below; confirm the chosen example before cloning. After cloning, `cd` into the sub-dir and treat that as the source for Q6/Q7.
 
@@ -1349,7 +1368,7 @@ than that prefix is filler.
 
 > **Q6/7: Run command?**
 > What is the canonical "run my app" command, and what input data does
-> it need? Short is better — 30 s to 2 min, not a full training run.
+> it need? Short is better — 30 s to 2 min, ideally not a full run.
 
 *Agent behaviour (never emit):* You will profile this exact command. If the user's command is too long (>~2 min), suggest a shorter input / smaller problem size and confirm before continuing.
 
@@ -1983,6 +2002,11 @@ rocprofv3 --pmc VALUUtilization VALUBusy FetchSize WriteSize MemUnitStalled \
   host↔device transfers).
 
 ### MPI (multi-rank — and single-rank too, see callout)
+
+> **FOM measurement:** for a multi-rank / multi-GPU run, measure via
+> `rocbudai-submit --gpus N -- mpirun -np N ./app` (dedicated allocation,
+> same median/`[FACT]` summary). The `rocprofv3` / `rocprof-sys` commands
+> below are for traces/profiles.
 
 **Wrapper-order matters. This is the most common profile-hang cause
 on this cluster — see §1 rule 12.**

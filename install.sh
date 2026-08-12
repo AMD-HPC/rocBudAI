@@ -1117,6 +1117,13 @@ step_6_drop_modulefile() {
         run_root sed -i "s|setenv(\"ROCBUDAI_SPX_PARTITIONS\", \"[^\"]*\")|setenv(\"ROCBUDAI_SPX_PARTITIONS\", \"${SPX_PARTITIONS}\")|" "${dst}"
     fi
 
+    # Bake the site's multi-GPU bench partition into ROCBUDAI_SUBMIT_PARTITION
+    # (empty => rocbudai-submit uses the cluster default partition).
+    if [[ -n "${SUBMIT_PARTITION:-}" ]]; then
+        info "Setting ROCBUDAI_SUBMIT_PARTITION='${SUBMIT_PARTITION}' inside ${dst}"
+        run_root sed -i "s|setenv(\"ROCBUDAI_SUBMIT_PARTITION\", \"[^\"]*\")|setenv(\"ROCBUDAI_SUBMIT_PARTITION\", \"${SUBMIT_PARTITION}\")|" "${dst}"
+    fi
+
     # Bake the site's model into the modulefile default + allow-list so the
     # pulled model and the module's default can't desync (single source:
     # MODEL_NAME, from site.conf or --container).

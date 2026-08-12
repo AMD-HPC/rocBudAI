@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# rocbudai-submit — run a multi-rank / multi-GPU FOM on a dedicated Slurm GPU
+# allocation, returning the same median/[FACT] summary as rocbudai-bench.
+set -uo pipefail
+
+REPS=4
+GPUS=2
+MIN=15
+JSON_FLAG=""
+PART="${ROCBUDAI_SUBMIT_PARTITION:-}"
+
+err(){ echo "rocbudai-submit: error: $*" >&2; }
+
+usage(){
+    cat <<'EOF'
+rocbudai-submit [OPTIONS] -- <command> [args...]
+    --gpus N        GPUs to allocate, one rank per GPU (default 2).
+    -n, --reps N    Reps including warmup, passed to rocbudai-bench (default 4).
+    -p, --partition Slurm partition. Default $ROCBUDAI_SUBMIT_PARTITION, else the
+                    cluster default partition.
+    --time MIN      Job time limit in minutes (default 15).
+    --json          Emit the rocbudai-bench JSON one-liner.
+    -h, --help      This help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpus)          GPUS="${2:?}"; shift 2 ;;
+        -n|--reps)       REPS="${2:?}"; shift 2 ;;
+        -p|--partition)  PART="${2:?}"; shift 2 ;;
+        --time)          MIN="${2:?}"; shift 2 ;;
+        --json)          JSON_FLAG="--json"; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              shift; break ;;
+        -*)              err "unknown option: $1"; usage >&2; exit 2 ;;
+        *)               break ;;
+    esac
+done
+
+[[ $# -gt 0 ]] || { err "no command after '--'"; usage >&2; exit 2; }
+[[ "$GPUS" =~ ^[0-9]+$ && "$GPUS" -ge 1 ]] || { err "--gpus must be a positive integer"; exit 2; }
+command -v sbatch >/dev/null 2>&1 || { err "sbatch not found (Slurm required)"; exit 3; }
+
+SELF="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)"
+BENCH="$SELF/rocbudai-bench"
+[[ -x "$BENCH" ]] || { err "rocbudai-bench not found beside rocbudai-submit"; exit 3; }
+
+PART_ARG=()
+[[ -n "$PART" ]] && PART_ARG=(-p "$PART")
+DEV="$(seq -s, 0 $((GPUS - 1)))"
+OUT="$PWD/.rocbudai-submit.$$.out"
+SCRIPT="$(mktemp)"
+trap 'rm -f "$SCRIPT" "$OUT"' EXIT
+cat >"$SCRIPT" <<EOF
+#!/bin/bash
+export ROCBUDAI_BENCH_GPU=$DEV ROCBUDAI_BENCH_CPUS= ROCBUDAI_NO_FENCING=1
+exec "$BENCH" --no-wait -n $REPS $JSON_FLAG -- "\$@"
+EOF
+
+sbatch --wait "${PART_ARG[@]}" --gpus="$GPUS" --ntasks="$GPUS" --time="$MIN" \
+       --export=ALL --chdir="$PWD" -J rocbudai-submit -o "$OUT" "$SCRIPT" "$@"
+rc=$?
+
+[[ -f "$OUT" ]] && cat "$OUT"
+echo "rocbudai-submit: $GPUS-GPU FOM on partition '${PART:-<cluster default>}' (dedicated alloc); not comparable to the single-GPU rocbudai-bench number" >&2
+exit $rc

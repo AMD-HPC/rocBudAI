@@ -137,6 +137,9 @@ setenv("ROCBUDAI_ALLOWED_MODELS", "qwen3.5:122b,gpt-oss:120b,nemotron-3-super:12
 -- in deploy/comment-gating/job_submit.lua (the submit-time enforcer).
 setenv("ROCBUDAI_SPX_PARTITIONS", "PPAC_MI300A_SPX")
 
+-- rocbudai-submit multi-GPU bench partition; "" => cluster default.
+setenv("ROCBUDAI_SUBMIT_PARTITION", "")
+
 -- Arch-specific AGENTS persona. install.sh resolves this from --gfx-arch /
 -- autodetect (narrowing gfx942 to MI300A APU vs MI300X discrete via
 -- detect_mi300a) and re-targets the path below to the matching file:
