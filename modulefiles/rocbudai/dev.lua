@@ -61,6 +61,8 @@ whatis("Version     : dev (rolling)")
 whatis("Description : AMD GPU profiling/optimisation AI assistant (OpenCode + Ollama)")
 whatis("URL         : man rocbudai (or https://github.com/AMD-HPC/rocbudai)")
 
+load("rocm")
+
 local root = "/shared/apps/ubuntu/opt/rocbudai"
 
 prepend_path("PATH", pathJoin(root, "bin"))
