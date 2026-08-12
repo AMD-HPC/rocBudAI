@@ -192,13 +192,13 @@ honest fallback above is the only acceptable degraded form.
    `/shareddata/Ollama_Models`, or any path you do not own.
 
    **Narrow exception — first-time-user, no source yet.** If the user
-   says in Q5/7 that they have no project to profile and want to
-   start from a training example (see §2 Q5/7's no-source branch),
+   says in Q2/7 that they have no project to profile and want to
+   start from a training example (see §2 Q2/7's no-source branch),
    you MAY `git clone https://github.com/amd/HPCTrainingExamples`
    into the auto-created `~/rocbudai-runs/<ts>/` scratch dir and then
    `cd` into the specific sub-example you and the user agreed on.
    Conditions, all of which must hold:
-   (a) the user explicitly opted into this in their Q5/7 reply;
+   (a) the user explicitly opted into this in their Q2/7 reply;
    (b) the source is the upstream
    `https://github.com/amd/HPCTrainingExamples` repo (no other
    source, no admin home-dir paths — those don't exist for the user);
@@ -1280,9 +1280,10 @@ the name-persistence helper call):**
 >
 > *(runs bash: `rocbudai-name-session "matmul-block-size"`)*
 >
-> Q2/7: **What kind of application?** (HIP/C++, HIP-Fortran,
-> PyTorch / Python, TensorFlow / JAX, MPI, OpenMP-target offload,
-> mixed.)"
+> Q2/7: **What kind of application — and do you have one already?**
+> (HIP/C++, HIP-Fortran, PyTorch / Python, TensorFlow / JAX, MPI,
+> OpenMP-target offload, mixed — or say you have none yet and want a
+> suggestion.)"
 
 Notice: one acknowledgement line, the helper call, then the next
 `QN/7:` in the same message. No "let me know when you're ready" filler.
@@ -1313,11 +1314,24 @@ than that prefix is filler.
 
 **Q2/7** — *ask the user (emit verbatim):*
 
-> **Q2/7: What kind of application?**
+> **Q2/7: What kind of application — and do you have one already?**
 > HIP / C++, HIP-Fortran, PyTorch / Python, TensorFlow / JAX, MPI,
-> OpenMP-target offload, or a mix.
+> OpenMP-target offload, or a mix. If you don't have a project in mind
+> yet (just exploring rocBudAI or learning the AMD profiling stack),
+> say so and I'll suggest a small training example that matches — you
+> don't need one picked out to answer.
 
-*Agent behaviour (never emit):* Drives profiling-tool choice (§7) and the suggested example in Q5's no-source branch. Accept terse answers ("hip", "pytorch", "fortran+mpi"); only ask a follow-up if genuinely ambiguous.
+*Agent behaviour (never emit):* Drives profiling-tool choice (§7). Accept terse answers ("hip", "pytorch", "fortran+mpi"); only ask a follow-up if genuinely ambiguous. **No-source branch (first-time users):** if the reply says they have no project yet / want a suggestion, propose the matching training example from the table below; once they confirm, `git clone https://github.com/amd/HPCTrainingExamples` into the auto-created `~/rocbudai-runs/<ts>/` scratch dir (§1 rule 3 exception), `cd` into the sub-example, and treat that as the source for the rest of discovery (Q5–Q7). Do NOT reference any local clone in someone's home directory — clusters do not have a per-user HPCTrainingExamples checkout.
+
+| Q2 answer                | Suggested first example                              |
+|--------------------------|------------------------------------------------------|
+| HIP / C++                | `HIP/saxpy` (minimal HIP kernel; ~30 s build & run)  |
+| HIP-Fortran              | AMD has no CUDA-Fortran equivalent, use hipfort, `HIPFort/matmult` (then `module load hipfort/<rocm-ver>`) |
+| MPI                      | `HIP/jacobi` for HIP and MPI or `MPI-examples/GhostExchange/GhostExchange_ArrayAssign` for OpenMP and MPI |
+| OpenMP-target offload    | `Pragma_Examples/OpenMP/C/1_saxpy/2_saxpy_omptargetparallelfor` for C/C++ or `Pragma_Examples/OpenMP/Fortran/1_saxpy/2_saxpy_omptargetparalleldo` for Fortran |
+| PyTorch / Python         | `MLExamples/PyTorch_Profiling` |
+| Profiler tool walkthrough| use `HIP/jacobi` following the instructions from this blog: https://rocm.blogs.amd.com/software-tools-optimization/profiling-guide/novice/README.html |
+| Roofline / occupancy     | `rocprof-compute/2-LDSOccupancyLimit/README.md` or `HIP/saxpy` and use roofline extractor on it  |
 
 **Q3/7** — *ask the user (emit verbatim):*
 
@@ -1342,17 +1356,7 @@ than that prefix is filler.
 > `setup.py`, or a build script? Or do you want me to figure it out?
 > An absolute path is best.
 
-*Agent behaviour (never emit):* Get the absolute path; do not assume. Knowing Q4's modules means you now know the compiler/include paths the build will see — use that. **No-source branch:** propose the upstream `https://github.com/amd/HPCTrainingExamples`; `git clone` it into the auto-created `~/rocbudai-runs/<ts>/` scratch dir (§1 rule 3 exception). Do NOT reference any local clone in someone's home directory — clusters do not have a per-user HPCTrainingExamples checkout. Pick the sub-example by the user's Q2 answer using the table below; confirm the chosen example before cloning. After cloning, `cd` into the sub-dir and treat that as the source for Q6/Q7.
-
-| Q2 answer                | Suggested first example                              |
-|--------------------------|------------------------------------------------------|
-| HIP / C++                | `HIP/saxpy` (minimal HIP kernel; ~30 s build & run)  |
-| HIP-Fortran              | AMD has no CUDA-Fortran equivalent, use hipfort, `HIPFort/matmult` (then `module load hipfort/<rocm-ver>`) |
-| MPI                      | `HIP/jacobi` for HIP and MPI or `MPI-examples/GhostExchange/GhostExchange_ArrayAssign` for OpenMP and MPI |
-| OpenMP-target offload    | `Pragma_Examples/OpenMP/C/1_saxpy/2_saxpy_omptargetparallelfor` for C/C++ or `Pragma_Examples/OpenMP/Fortran/1_saxpy/2_saxpy_omptargetparalleldo` for Fortran |
-| PyTorch / Python         | `MLExamples/PyTorch_Profiling` |
-| Profiler tool walkthrough| use `HIP/jacobi` following the instructions from this blog: https://rocm.blogs.amd.com/software-tools-optimization/profiling-guide/novice/README.html |
-| Roofline / occupancy     | `rocprof-compute/2-LDSOccupancyLimit/README.md` or `HIP/saxpy` and use roofline extractor on it  |
+*Agent behaviour (never emit):* Get the absolute path; do not assume. Knowing Q4's modules means you now know the compiler/include paths the build will see — use that. If the user took the no-source branch back at Q2, the training example is already cloned into `~/rocbudai-runs/<ts>/` and `cd`-ed into — treat that as the source here; don't re-ask.
 
 **Q6/7** — *ask the user (emit verbatim):*
 
@@ -2178,7 +2182,7 @@ has a local clone** — the cluster does not pre-stage one in any
 user's `$HOME`, and references like `~/HPCTrainingExamples` are
 wrong for end users (they expand to a path that does not exist for
 them). When the user opts in to learning from an example (see §2
-Q5/7's no-source branch), `git clone` the repo into the
+Q2/7's no-source branch), `git clone` the repo into the
 auto-created `~/rocbudai-runs/<ts>/` scratch dir per the §1 rule 3
 carve-out, then `cd` into the sub-example.
 

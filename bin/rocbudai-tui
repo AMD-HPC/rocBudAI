@@ -962,6 +962,10 @@ else
     cat > .rocbudai-banner.md <<EOF
 Welcome to rocBudAI — your AMD GPU profiling assistant.
 
+IMPORTANT: remind the agent to use rocbudai-bench for single rank
+and/or single GPU runs, and rocbudai-submit for multi rank and/or
+multi GPU runs.
+
 Session info:
   Node:        $(hostname)
   Slurm job:   ${SLURM_JOB_ID:-(not in alloc)}
