@@ -253,12 +253,9 @@ time_one_rep() {
     # region) and no forced HSA_XNACK (inherited from the caller's env if
     # set). For MPI FOMs, intra-node rank binding stays the user's job
     # (e.g. mpirun --bind-to core); this taskset just sets the cpuset.
-    # A leading run of NAME=VALUE tokens is a shell-style env prefix
-    # (e.g. `HIP_VISIBLE_DEVICES=0,1,2,3 ./app`). /usr/bin/time is not a shell
-    # and would exec the first such token as the program (exit 127), so peel
-    # them into the env pin as a shell would. The loop stops at the first
-    # non-assignment token, leaving a trailing `make CC=gcc`-style arg intact,
-    # and always keeps at least one token as the program to run.
+    # /usr/bin/time is not a shell, so a leading NAME=VALUE token would be
+    # exec'd as the program name (exit 127). Peel a leading run of assignments
+    # into the env pin, shell-style (stops at the first non-assignment token).
     local -a envpfx=()
     while [[ $# -gt 1 && "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
         envpfx+=("$1"); shift
