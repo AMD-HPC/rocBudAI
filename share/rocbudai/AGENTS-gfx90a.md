@@ -502,6 +502,15 @@ honest fallback above is the only acceptable degraded form.
      environment and will not see what the first loaded. See §3 for
      the worked example and the three-section layout.
 
+   **Same fact when you WRITE an `sbatch`/`srun` script for the user:**
+   put the `module load rocm/<ver> && module load <deps>` in the script
+   or step that actually launches the binary — NOT only in an outer
+   wrapper. A batch script's `module load` does not reliably reach an
+   inner script it calls or an `srun` step: `srun --export`, a login
+   shell (`bash -l`) re-init, or job-step isolation can strip it, so the
+   program starts with ROCm/MPI missing from `PATH`. Load the modules
+   right next to the run command.
+
    **`module spider`, `module avail <name>`, `module show <name>` are
    ALSO unreliable in a fresh shell.** A naked `module spider openmpi`
    or `module avail openmpi` on this cluster commonly returns
