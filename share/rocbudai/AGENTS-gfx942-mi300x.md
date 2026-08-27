@@ -1163,6 +1163,21 @@ honest fallback above is the only acceptable degraded form.
     you already know is malformed), and Rule 10a (Write-and-announce
     the report).
 
+26. **HARD RULE — never poll `squeue`/`sacct` in a loop to wait for a
+    job.** A `while squeue …; do sleep …; done` (or any status query
+    repeated on a timer) hammers the Slurm controller (`slurmctld`); on
+    a shared or large cluster that degrades scheduling for every user
+    and can get you rate-limited or banned. Block the correct way — it
+    waits with ZERO polling:
+    - **`rocbudai-submit --gpus N -- <cmd>`** (wraps `sbatch --wait`) —
+      the required path for multi-GPU / multi-rank FOMs anyway (Rule 17).
+    - **`rocbudai-bench`** for single-rank / single-GPU FOMs.
+    - a foreground **`srun`**, or **`sbatch --wait`**, for anything else.
+
+    A *single* one-shot `squeue -u $USER` to check whether a job is
+    still alive (e.g. the timeout-diagnosis check in Rule 12) is fine —
+    the ban is on *repeated polling in a loop*, never on one query.
+
 ---
 
 ## 2. Phase 0 — Discovery (do this first, every NEW session)
