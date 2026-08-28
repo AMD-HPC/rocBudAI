@@ -1864,8 +1864,12 @@ This applies to the build step, profile step, and every iteration.
 
 > The admin keeps a curated knowledge base. **Resolve the KB directory
 > once, in this order, and use the first that exists:**
+> - `$ROCBUDAI_KB_INPUTS_DIR` — the install-time KB pointer, when set (by
+>   the modulefile or a user export). Customizable; the AIM client sets it
+>   to the in-`$HOME` clone's `share/rocbudai/kb/`.
 > - `/shareddata/rocbudai/docs/inputs/` — the full host KB (slides,
->   papers, internal write-ups). Present on a real host install.
+>   papers, internal write-ups) on the reference cluster, when the env var
+>   is unset.
 > - `${ROCBUDAI_ROOT}/share/rocbudai/kb/` — the base KB shipped in-repo
 >   (public ROCm-tool docs only: `rocprofv3`/`rocprof-sys`,
 >   `rocprof-compute`, `rocpd`, and the optimization plays). This is the
