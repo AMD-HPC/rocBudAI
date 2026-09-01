@@ -26,15 +26,25 @@ set -u
 
 log() { logger -t "rocbudai-egress-prolog" "$*"; echo "[rocbudai-egress-prolog] $*" >&2; }
 
-job_comment="${SLURM_JOB_COMMENT:-}"
-if [[ "$job_comment" != *ollama* ]]; then
-    exit 0
-fi
-
 job_id="${SLURM_JOB_ID:-}"
 job_user="${SLURM_JOB_USER:-}"
 if [[ -z "$job_id" || -z "$job_user" ]]; then
     log "missing SLURM_JOB_ID/USER, skipping"
+    exit 0
+fi
+
+# Resolve the comment via scontrol (authoritative); Slurm does not reliably
+# export SLURM_JOB_COMMENT into the prolog/epilog env across versions, so
+# trusting the env var alone silently skips the block. Mirrors how
+# rocbudai-tui / -doctor / -airgap-check resolve it.
+job_comment=""
+if command -v scontrol >/dev/null 2>&1; then
+    job_comment="$(scontrol show job "$job_id" -o 2>/dev/null \
+        | grep -oE 'Comment=[^[:space:]]+' | head -1 | sed 's/^Comment=//')"
+    [[ "$job_comment" == "(null)" ]] && job_comment=""
+fi
+job_comment="${job_comment:-${SLURM_JOB_COMMENT:-}}"
+if [[ "$job_comment" != *ollama* ]]; then
     exit 0
 fi
 
