@@ -1,0 +1,123 @@
+#%Module1.0
+#
+# rocbudai/dev — rocBudAI (AMD GPU profiling/optimisation AI assistant)
+#
+# Tcl (Environment Modules) translation of dev.lua, for sites whose `module`
+# command is Environment Modules / Cray PE rather than Lmod (.lua only works
+# under Lmod). install.sh step 6 installs THIS file when MODULE_FLAVOR resolves
+# to "tcl", and sed-retargets the path / partition / model literals below (which
+# MUST match the *_DEFAULT constants install.sh compares against). Keep this file
+# behaviourally in sync with dev.lua.
+#
+# Loading on a compute node with an interactive TTY auto-launches the OpenCode
+# TUI (via libexec/rocbudai-load-hook.sh). Loading on a login node just sets
+# PATH and prints a hint.
+
+proc ModulesHelp { } {
+    puts stderr "rocBudAI — AMD GPU profiling/optimisation AI assistant (dev, rolling prototype)."
+    puts stderr ""
+    puts stderr "Workflow:"
+    puts stderr "  # 1. On the login node, allocate an SPX compute node:"
+    puts stderr "  salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama --time=01:00:00"
+    puts stderr "  # 2. On the compute node, cd into your project and load the module:"
+    puts stderr "  cd <project-dir>"
+    puts stderr "  module load rocbudai            ;# -> launches the OpenCode TUI"
+    puts stderr ""
+    puts stderr "  rocbudai --continue   resume last session in this dir"
+    puts stderr "  rocbudai --new        force a fresh session"
+    puts stderr ""
+    puts stderr "To leave the TUI:        /exit  (or Ctrl-D)"
+    puts stderr "To opt into auto-run:    export ROCBUDAI_AUTORUN=1 ; module load rocbudai"
+    puts stderr "Documentation:           man rocbudai"
+}
+
+module-whatis "Name        : rocbudai"
+module-whatis "Version     : dev (rolling)"
+module-whatis "Description : AMD GPU profiling/optimisation AI assistant (OpenCode + Ollama)"
+module-whatis "URL         : man rocbudai (or https://github.com/AMD-HPC/rocbudai)"
+
+# Ensure a ROCm toolkit is available for the profiling tools rocBudAI drives.
+# Site ROCm modules typically declare `conflict rocm`, so only load one when no
+# ROCm toolkit is loaded yet; otherwise keep whatever the user already has.
+if {![is-loaded rocm]} {
+    module load rocm
+}
+
+set root /shared/apps/ubuntu/opt/rocbudai
+
+prepend-path PATH $root/bin
+# /shared/apps/ubuntu/man is the install destination for share/man/man1/rocbudai.1
+# (in MANPATH on login nodes by default but NOT on compute nodes); prepend it so
+# `man rocbudai` works in a compute-node session too.
+prepend-path MANPATH /shared/apps/ubuntu/man
+
+# --- environment (accumulated for the auto-launch, see the note below) -------
+# ORDERING NOTE (Cray Environment Modules / Tcl): modulecmd emits `puts stdout`
+# output to the shell BEFORE the accumulated setenv/prepend-path exports. This is
+# the OPPOSITE of Lmod's execute{} ordering that dev.lua relies on, so a bare
+# `puts stdout "bash ...hook"` would run the hook with the OLD PATH and none of
+# the ROCBUDAI_*/OPENCODE_* vars set. Fix: keep setenv/prepend-path so the shell
+# env is correct after load, but ALSO record each var via rb_setenv so the
+# auto-launch line can pass them (and PATH) inline to the hook.
+set rb_launch_env {}
+proc rb_setenv {var val} {
+    global rb_launch_env
+    setenv $var $val
+    lappend rb_launch_env $var $val
+}
+
+rb_setenv ROCBUDAI_ROOT $root
+rb_setenv ROCBUDAI_OPENCODE_BIN /shared/apps/ubuntu/opt/opencode/1.14.28/opencode
+rb_setenv ROCBUDAI_OLLAMA_HOST http://127.0.0.1:11434
+
+# If compute nodes route outbound HTTPS through a site proxy (http_proxy /
+# https_proxy set), the OpenCode client MUST bypass it for the localhost daemon.
+# Merge localhost into any existing no_proxy rather than clobbering it.
+foreach _np {no_proxy NO_PROXY} {
+    if {[info exists env($_np)] && $env($_np) ne ""} {
+        rb_setenv $_np "$env($_np),127.0.0.1,localhost"
+    } else {
+        rb_setenv $_np "127.0.0.1,localhost"
+    }
+}
+unset _np
+
+# opencode phone-home suppression (see dev.lua for the per-variable rationale).
+rb_setenv OPENCODE_DISABLE_AUTOUPDATE 1
+rb_setenv OPENCODE_DISABLE_LSP_DOWNLOAD 1
+rb_setenv OPENCODE_DISABLE_MODELS_FETCH 1
+rb_setenv OPENCODE_DISABLE_EXTERNAL_SKILLS 1
+rb_setenv OPENCODE_DISABLE_SHARE 1
+
+# Default model — only set if the user hasn't already exported one.
+if {![info exists env(ROCBUDAI_MODEL)] || $env(ROCBUDAI_MODEL) eq ""} {
+    rb_setenv ROCBUDAI_MODEL qwen3.5:122b
+}
+
+# Admin-curated allow-list (set unconditionally; users cannot legitimately
+# choose which models are installed on the cluster).
+rb_setenv ROCBUDAI_ALLOWED_MODELS "qwen3.5:122b,gpt-oss:120b,nemotron-3-super:120b"
+
+# Slurm partition gate (comma-separated). install.sh rewrites the value.
+rb_setenv ROCBUDAI_SPX_PARTITIONS "PPAC_MI300A_SPX"
+
+# rocbudai-submit multi-GPU bench partition; "" => cluster default.
+rb_setenv ROCBUDAI_SUBMIT_PARTITION ""
+
+# AGENTS persona is resolved at runtime by rocbudai-tui from the live GPU on the
+# compute node (see _persona_for_arch), so it is NOT baked here. A user may still
+# force one: export ROCBUDAI_AGENTS_TEMPLATE=<file> before `module load rocbudai`.
+
+# Auto-launch the TUI on `module load` (the Lmod execute{} equivalent). Because
+# of the ordering note above, we prefix the hook with an `env` that carries the
+# module's PATH and every recorded var, so rocbudai-tui is both found and fully
+# configured even though modulecmd hasn't exported them to the shell yet. The
+# setenv calls above still apply afterwards, so the user's shell keeps them.
+if {[module-info mode load]} {
+    set _assigns "PATH=$root/bin:\$PATH"
+    foreach {_k _v} $rb_launch_env {
+        append _assigns " $_k='$_v'"
+    }
+    puts stdout "env $_assigns bash $root/libexec/rocbudai-load-hook.sh;"
+    unset _assigns _k _v
+}

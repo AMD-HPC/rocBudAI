@@ -43,11 +43,11 @@ distros / schedulers is straightforward.
 > **GPU architecture.** `install.sh` autodetects the GPU arch via
 > `rocminfo`; currently supported archs are `gfx90a`, `gfx942`, `gfx950`. Pass
 > `--gfx-arch <arch>` to override; anything outside the supported set
-> aborts. The detected arch selects the **AGENTS persona** baked into the
-> modulefile (`gfx90a`→`AGENTS-gfx90a.md` MI250X, `gfx942`→`AGENTS-default.md`
-> MI300A APU or `AGENTS-gfx942-mi300x.md` MI300X discrete via the rocminfo
-> APU marker, `gfx950`→`AGENTS-gfx950.md` MI355X), so `rocbudai-tui` seeds
-> the right spec table and optimization playbooks; override with
+> aborts. This is a preflight sanity check only — the **AGENTS persona** is
+> **not** baked at install time (staging often runs on a GPU-less login node,
+> where any arch guess is unreliable). Instead `rocbudai-tui` resolves it at
+> launch from the live GPU on the compute node and seeds the right spec table
+> and optimization playbooks; override with
 > `export ROCBUDAI_AGENTS_TEMPLATE=<file>` before `module load`. The installer reserves the
 > last GPU on the node for `rocbudai-bench` and serves the model on
 > the remaining GPUs (a systemd drop-in,
@@ -154,6 +154,13 @@ sudo apt-get install -y zstd curl ca-certificates
 # version already includes the MI300A unified-memory fix, so no rebuild.
 curl -fsSL https://ollama.com/install.sh | sudo OLLAMA_VERSION=0.31.1 sh
 ```
+
+**Behind an outbound proxy.** If compute nodes reach the internet only via an
+HTTP(S) proxy, set `SITE_HTTP_PROXY` (and `SITE_NO_PROXY`) in `site.conf`.
+`install.sh` then prefixes the vendor installer and opencode download with it,
+**and** writes an `ollama.service.d/10-proxy.conf` drop-in so the daemon uses it
+— the step-3 `ollama pull` is performed by the daemon, not the shell, so without
+that drop-in a proxied site's model pull hangs reaching `registry.ollama.ai`.
 
 The installer places the binary at `/usr/local/bin/ollama`, creates
 the `ollama` system user, and drops a systemd unit (which step 2
@@ -304,6 +311,20 @@ sudo cp /etc/systemd/system/ollama.service \
 sudo wwctl container build ubuntu-24.04
 ```
 
+For a complete per-node laydown into a provisioning image, use the
+`--image-bake` mode, which bakes the ollama unit + optional proxy drop-in +
+static GPU/CPU split + NVMe model-cache + the `ollama` user and offline-enables
+the boot services (no live systemd/GPU needed), then rebuilds the image with
+`wwctl` if present:
+
+```bash
+sudo ./install.sh --image-bake /var/local/warewulf/chroots/ubuntu-24.04/rootfs
+```
+
+Tunables: `IMAGE_GPU_COUNT`, `IMAGE_ALLOWED_CPUS`, `IMAGE_ENABLE_OLLAMA` (see
+`site.conf.example`). Shared components (opencode, install tree, modulefile) are
+**not** baked — install them once on the NFS share with a normal run.
+
 ### 3. Pull the canonical model
 
 The model store on NFS needs to be writable by the `ollama` user.
@@ -436,10 +457,16 @@ disk after this step):
 │   ├── AGENTS-container-demo.md  compact standalone container quick-test persona
 │   └── kb/                      per-arch optimization-playbook knowledge base
 └── modulefiles/rocbudai/
-    └── dev.lua                  the modulefile (gets dropped at the site path)
+    ├── dev.lua                  the Lmod modulefile (gets dropped at the site path)
+    └── dev                      the Tcl equivalent (Environment Modules / Cray PE)
 ```
 
 ### 6. Drop the modulefile on the site MODULEPATH
+
+Install the modulefile flavour that matches your `module` command: `dev.lua`
+for **Lmod**, or `dev` for **Environment Modules / Cray PE (Tcl)**. `install.sh`
+picks it via `MODULE_FLAVOR` (`auto`/`lmod`/`tcl`; auto-detected by default). By
+hand, use the Lmod copy:
 
 ```bash
 SITE_MODULES=/shared/apps/modules/ubuntu/lmodfiles/base
@@ -448,6 +475,10 @@ sudo cp /shared/apps/ubuntu/opt/rocbudai/modulefiles/rocbudai/dev.lua \
         ${SITE_MODULES}/rocbudai/dev.lua
 sudo chown root:root ${SITE_MODULES}/rocbudai/dev.lua
 ```
+
+On a Tcl (Environment Modules) site, copy `modulefiles/rocbudai/dev` instead
+(to `${SITE_MODULES}/rocbudai/dev`); the two files are kept behaviourally in
+sync and the retargeting below applies to whichever one you installed.
 
 If you staged the install tree at a path other than
 `/shared/apps/ubuntu/opt/rocbudai`, retarget the modulefile:
@@ -459,18 +490,10 @@ sudo sed -i \
    ${SITE_MODULES}/rocbudai/dev.lua
 ```
 
-The modulefile defaults the AGENTS persona to `AGENTS-default.md` (MI300A).
-On any other arch, retarget it so `rocbudai-tui` seeds the matching
-spec table + playbooks (`install.sh` does this automatically; by hand,
-pick the file for your GPU):
-
-```bash
-# MI250X/MI210 → AGENTS-gfx90a.md, MI300X → AGENTS-gfx942-mi300x.md,
-# MI355X/MI350X → AGENTS-gfx950.md
-sudo sed -i \
-   's|share/rocbudai/AGENTS-default.md|share/rocbudai/AGENTS-gfx950.md|' \
-   ${SITE_MODULES}/rocbudai/dev.lua
-```
+The AGENTS persona is **not** baked into the modulefile: `rocbudai-tui` resolves
+it at launch from the live GPU on the compute node (`gfx90a`→MI250X/MI210,
+`gfx942`→MI300A/MI300X, `gfx950`→MI355X/MI350X). To force a specific persona,
+`export ROCBUDAI_AGENTS_TEMPLATE=<file>` before `module load rocbudai`.
 
 The `bin/` scripts (`rocbudai`, `rocbudai-tui`, `rocbudai-doctor`,
 `rocbudai-name-session`, `rocbudai-prune-sessions`,
@@ -577,8 +600,15 @@ full knob list.
      loopback, cluster DNS, and RFC1918 are permitted. The block is
      UID-scoped so it does not affect other users or system daemons
      on the node.
+  4. **`rocbudai-user-egress.service`** — boot-time unit that loads an
+     empty `nft inet rocbudai_user_egress` skeleton table. The Slurm
+     egress prolog (`--with-comment-gating`) adds a per-job jump chain
+     scoped to the launching user's UID for the life of each
+     `--comment=ollama` allocation. Without this table pre-loaded the
+     prolog fails CLOSED (aborts the job) and `rocbudai-airgap-check`
+     section 6 stays red.
 
-  All three are **always on** for any `--comment=ollama` allocation —
+  All four are **always on** for any `--comment=ollama` allocation —
   there is no user opt-in switch. Users can verify the baseline
   themselves on the compute node with `rocbudai-airgap-check`
   (user-visible probes, no sudo) or `rocbudai-airgap-check --deep`
@@ -587,8 +617,9 @@ full knob list.
   rocBudAI helpers.
 
   Source artefacts (in this repo): `deploy/airgap/`
-  (`opencode-managed.json`, `ollama-egress.{nft,service}`, plus a
-  `README.md` with the per-file deployment map). Design and the
+  (`opencode-managed.json`, `ollama-egress.{nft,service}`,
+  `rocbudai-user-egress.{nft,service}`, plus a `README.md` with the
+  per-file deployment map). Design and the
   model-pull-relock procedure (how an admin pulls a new model after
   the cluster is airgapped): `docs/airgap-and-model-pulls.md` in this
   repo (deployed at `/shareddata/rocbudai/docs/airgap-and-model-pulls.md`).
@@ -707,8 +738,9 @@ sudo rm -rf /shareddata/Ollama_Models   # 65+ GB — confirm before running
 - **Different scheduler** (PBS, LSF) — the modulefile's auto-launch
   logic only checks `SLURM_JOB_ID`; replace with `PBS_JOBID` /
   `LSB_JOBID` in `libexec/rocbudai-load-hook.sh`.
-- **No Lmod** — convert `dev.lua` to a Tcl modulefile or wrap
-  `bin/rocbudai-tui` in a shell function the user sources.
+- **No Lmod** — a Tcl modulefile (`modulefiles/rocbudai/dev`) ships for
+  Environment Modules / Cray PE sites; set `MODULE_FLAVOR=tcl` (or leave
+  `auto`) so `install.sh` installs it instead of `dev.lua`.
 - **Different default model** — pull whatever fits your VRAM budget
   and either change the modulefile's `setenv("ROCBUDAI_MODEL", …)`
   default or have users pre-export `ROCBUDAI_MODEL` before

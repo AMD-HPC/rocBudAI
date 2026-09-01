@@ -34,7 +34,17 @@ OPENCODE_VERSION="1.14.28"
 # OPENCODE_VERSION. This release already contains the MI300A unified-memory fix
 # (issue #8735 / PR #13463, merged upstream), so no source rebuild is needed.
 OLLAMA_VERSION="0.31.1"
+# Outbound HTTP(S) proxy for install-time fetches. Empty = direct egress (the
+# default). When set it is applied to: the ollama vendor installer, the opencode
+# download, AND a systemd drop-in so the DAEMON uses it — step 3's `ollama pull`
+# is performed by the daemon, not the shell, so without the drop-in a proxied
+# site's model pull hangs reaching registry.ollama.ai.
+SITE_HTTP_PROXY=""
+SITE_NO_PROXY="localhost,127.0.0.1"
 SITE_MODULES="/shared/apps/modules/ubuntu/lmodfiles/base"
+# Module system flavour: lmod (installs dev.lua), tcl (installs the Tcl
+# dev, for Environment Modules / Cray PE), or auto (detect at step 6).
+MODULE_FLAVOR="auto"
 # The --container wrapper re-invokes this script with MODEL_NAME=<small model>
 # in the environment. Capture it so it still wins after site.conf is sourced
 # (precedence: built-in default < site.conf < container/env).
@@ -92,6 +102,18 @@ MODEL_CACHE_DIR="/var/local/cache/ollama"
 # NOTE: the agent-side path also appears in the AGENTS personas + README, which
 # this script does NOT rewrite — a relocated KB needs those edited too.
 KB_INPUTS_DIR="/shareddata/rocbudai/docs/inputs"
+
+# --- Provisioning image-bake knobs (--image-bake CHROOT) -------------------
+# GPU dies per node; used to compute the static LLM/bench GPU split
+# (LLM on dies 0..N-2, rocbudai-bench on die N-1). <2 skips the split.
+IMAGE_GPU_COUNT=4
+# systemd AllowedCPUs= for the LLM dies. Empty = GPU isolation only (safe);
+# NUMA topology is node-specific, so derive it on a booted node with
+# libexec/rocbudai-detect-topology.sh (its ROCBUDAI_LLM_CPUS value) and set here.
+IMAGE_ALLOWED_CPUS=""
+# 1 = enable ollama.service at boot in the image; 0 = leave disabled so the
+# --comment=ollama Slurm prolog starts it per job.
+IMAGE_ENABLE_OLLAMA=1
 
 # NOTE: the on-disk model store path is NOT a CONFIGURATION knob. It is
 # read from deploy/ollama-daemon/ollama.service (the OLLAMA_MODELS=…
@@ -171,6 +193,8 @@ fi
 
 DRY_RUN=0
 ASSUME_YES=0
+IMAGE_BAKE=0
+IMAGE_BAKE_CHROOT=""
 
 usage() {
     cat <<EOF
@@ -207,6 +231,21 @@ Options:
       --rocm-version V    ROCm version for the image (default: ${ROCM_VERSION}).
       --distro D          Distro for the image (default: ${DISTRO}).
       --distro-version V  Distro version for the image (default: ${DISTRO_VERSION}).
+
+  Provisioning image-bake mode (flat, no live services):
+      --image-bake CHROOT
+                      Lay the PER-NODE ollama pieces into a provisioning image
+                      chroot (e.g. a Warewulf <chroots>/<img>/rootfs) and enable
+                      the boot-time services OFFLINE. Does NOT start any service,
+                      reload systemd, or pull a model — a chroot has no PID-1
+                      systemd or GPU, so those happen at first boot on a real
+                      node (the model already lives on the NFS store). Bakes the
+                      ollama unit + optional proxy drop-in + static GPU split +
+                      NVMe model-cache + the 'ollama' user. Tunables:
+                      IMAGE_GPU_COUNT, IMAGE_ALLOWED_CPUS, IMAGE_ENABLE_OLLAMA
+                      (see CONFIGURATION). Shared components (opencode/tree/
+                      modulefile) are NOT baked; install them once on the NFS
+                      share with a normal run.
 
       The ONLY flags that apply with --container are --rocm-version, --distro,
       --distro-version (and --dry-run to preview). --gfx-arch is rejected;
@@ -252,6 +291,8 @@ while [[ $# -gt 0 ]]; do
             DISTRO="${2:?--distro requires an argument}"; shift 2 ;;
         --distro-version)
             DISTRO_VERSION="${2:?--distro-version requires an argument}"; shift 2 ;;
+        --image-bake)
+            IMAGE_BAKE=1; IMAGE_BAKE_CHROOT="${2:?--image-bake requires a chroot path}"; shift 2 ;;
         *)
             echo "ERROR: unknown option: $1" >&2
             echo "Try: $0 --help" >&2
@@ -387,40 +428,6 @@ detect_gfx_arch() {
         /Device Type:[[:space:]]+GPU/ { if (gfx != "") { print gfx; exit } }'
 }
 
-# detect_mi300a: returns 0 if this host has an MI300A APU.
-# The canonical signal is rocminfo reporting `gfx942` (the architecture
-# string shared by MI300A/X/Y; we then narrow to APU mode by checking
-# the agent type, since MI300A is the unified-memory variant). We
-# tolerate the standard non-PATH location /opt/rocm/bin/rocminfo too.
-# Used by step 6 to pick the MI300A (APU) vs MI300X (dGPU) AGENTS persona
-# for gfx942 hosts.
-detect_mi300a() {
-    local rocminfo=""
-    if command -v rocminfo >/dev/null 2>&1; then
-        rocminfo="rocminfo"
-    elif [[ -x /opt/rocm/bin/rocminfo ]]; then
-        rocminfo="/opt/rocm/bin/rocminfo"
-    else
-        return 1
-    fi
-
-    # rocminfo's output has per-agent stanzas with "Name:" and "Device Type:"
-    # lines. We look for an agent that is both gfx942 AND a GPU (filtering
-    # out CPU agents, which would also show up). MI300A specifically is
-    # gfx942 + APU; MI300X is gfx942 + discrete dGPU. For the patch's
-    # purposes (zero-VRAM on unified memory) both APUs and the dGPU report
-    # gfx942, but only the APU variant exhibits the unified-memory bug —
-    # so we tighten to "APU" / "Apu" in the Marketing Name when available.
-    "${rocminfo}" 2>/dev/null | grep -qE 'Name:[[:space:]]+gfx942' || return 1
-    "${rocminfo}" 2>/dev/null | grep -qiE 'Marketing Name:.*MI300A|Marketing Name:.*Instinct MI300A|APU' && return 0
-
-    # Fallback: a host that has gfx942 but no explicit APU marker. On a
-    # rocBudAI reference cluster this is still an MI300A — discrete
-    # MI300X has gfx940/gfx941. Be conservative and return false here so
-    # we don't trigger an unwanted source rebuild on dGPU hardware.
-    return 1
-}
-
 # ---------------------------------------------------------------------------
 # Sanity checks
 # ---------------------------------------------------------------------------
@@ -515,16 +522,30 @@ ollama_svc_group() {
     if [[ "${u}" == ollama ]]; then printf 'ollama'; else id -gn; fi
 }
 
+# Resolve the ollama binary to an ABSOLUTE path. `sudo -u ollama … ollama` runs
+# with sudo's secure_path (typically /sbin:/bin:/usr/sbin:/usr/bin), which does
+# NOT include /usr/local/bin where the vendor installer puts ollama — so a bare
+# name yields "sudo: ollama: command not found". The absolute path sidesteps it.
+ollama_bin() {
+    if command -v ollama >/dev/null 2>&1; then
+        command -v ollama
+    elif [[ -x /usr/local/bin/ollama ]]; then
+        printf '/usr/local/bin/ollama'
+    else
+        printf 'ollama'
+    fi
+}
+
 # Run the ollama CLI as the resolved service user, forwarding OLLAMA_HOST.
 # When the service user is the current user we skip sudo entirely (sudo may
 # not even be installed in a minimal container).
 run_ollama_cli() {
     local host="$1"; shift
-    local u; u="$(ollama_svc_user)"
+    local u obin; u="$(ollama_svc_user)"; obin="$(ollama_bin)"
     if [[ "${u}" == "$(id -un)" ]]; then
-        run_root env "OLLAMA_HOST=${host}" ollama "$@"
+        run_root env "OLLAMA_HOST=${host}" "${obin}" "$@"
     else
-        run_root sudo -u "${u}" "OLLAMA_HOST=${host}" -- ollama "$@"
+        run_root sudo -u "${u}" "OLLAMA_HOST=${host}" -- "${obin}" "$@"
     fi
 }
 
@@ -732,6 +753,15 @@ step_1_install_ollama() {
     # exit below — we don't try to second-guess that case.
     if command -v ollama >/dev/null 2>&1; then
         info "ollama already on PATH at $(command -v ollama). Skipping install."
+        # A bare 'curl|sh' (no OLLAMA_VERSION) installs 'latest' AND overwrites
+        # our unit — the recurring MI300A CPU-fallback regression.
+        local _have
+        _have="$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        if [[ -n "${_have}" && "${_have}" != "${OLLAMA_VERSION}" ]]; then
+            warn "Installed ollama ${_have} != pinned ${OLLAMA_VERSION}. Re-pin with:"
+            warn "  curl -fsSL https://ollama.com/install.sh | sudo OLLAMA_VERSION=${OLLAMA_VERSION} sh"
+            warn "then re-run this script so step 2 re-asserts our unit."
+        fi
     else
         # Host prereqs for the vendor installer:
         #   - zstd: recent vendor installers ship the binary as
@@ -751,7 +781,11 @@ step_1_install_ollama() {
         if ! command -v curl >/dev/null 2>&1; then
             die "curl is required for the upstream Ollama installer but is not on PATH. Install it (e.g. 'apt-get install -y curl') and re-run."
         fi
-        run_root_sh "curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION='${OLLAMA_VERSION}' sh"
+        # When SITE_HTTP_PROXY is set, prefix both the curl fetch and the piped
+        # installer (which downloads the ollama tarball) so both reach the net.
+        local _px=""
+        [[ -n "${SITE_HTTP_PROXY}" ]] && _px="https_proxy='${SITE_HTTP_PROXY}' http_proxy='${SITE_HTTP_PROXY}' no_proxy='${SITE_NO_PROXY}' "
+        run_root_sh "${_px}curl -fsSL https://ollama.com/install.sh | ${_px}OLLAMA_VERSION='${OLLAMA_VERSION}' sh"
 
         # The vendor installer probes for an AMD/NVIDIA GPU via lspci/lshw
         # (neither of which we ship in the bare_system rootfs) and, if it
@@ -839,6 +873,24 @@ step_2_configure_ollama() {
     run_root install -d -m 0755 /etc/systemd/system
     run_root install -m 0644 -o root -g root "${src}" "${dst}"
 
+    # When SITE_HTTP_PROXY is set, give the DAEMON the proxy via a drop-in: this
+    # is what makes step 3's `ollama pull` work, since the daemon (not the shell)
+    # performs the download. A drop-in survives re-deploys of the unit above.
+    if [[ -n "${SITE_HTTP_PROXY}" ]]; then
+        local proxy_dir="/etc/systemd/system/ollama.service.d"
+        info "Installing proxy drop-in ${proxy_dir}/10-proxy.conf (HTTP(S)_PROXY=${SITE_HTTP_PROXY})"
+        run_root install -d -m 0755 "${proxy_dir}"
+        local proxy_tmp; proxy_tmp="$(mktemp)"
+        {
+            echo "[Service]"
+            echo "Environment=\"HTTP_PROXY=${SITE_HTTP_PROXY}\""
+            echo "Environment=\"HTTPS_PROXY=${SITE_HTTP_PROXY}\""
+            echo "Environment=\"NO_PROXY=${SITE_NO_PROXY}\""
+        } > "${proxy_tmp}"
+        run_root install -m 0644 -o root -g root "${proxy_tmp}" "${proxy_dir}/10-proxy.conf"
+        rm -f "${proxy_tmp}"
+    fi
+
     if have_systemd; then
         run_root systemctl daemon-reload
         run_root systemctl restart ollama
@@ -848,6 +900,18 @@ step_2_configure_ollama() {
                 ok "ollama.service is active"
             else
                 warn "ollama.service is NOT active — check 'journalctl -u ollama'"
+            fi
+            # Verify the daemon inherited our unit's env; a vendor-stub unit
+            # drops these and the .d drop-ins alone don't restore them. The
+            # expected host is derived from the unit file (single source of truth).
+            local _want_host _oenv
+            _want_host="$(ollama_env_value OLLAMA_HOST)"
+            _oenv="$(systemctl show ollama -p Environment 2>/dev/null)"
+            if [[ -n "${_want_host}" && "${_oenv}" != *"OLLAMA_HOST=${_want_host}"* ]]; then
+                warn "ollama env missing OLLAMA_HOST=${_want_host} (vendor-stub unit? TUI won't reach the daemon)."
+            fi
+            if [[ "${_oenv}" != *"OLLAMA_IGPU_ENABLE=1"* ]]; then
+                warn "ollama env missing OLLAMA_IGPU_ENABLE=1 (integrated GPUs / APUs fall back to CPU)."
             fi
         fi
     else
@@ -1018,7 +1082,9 @@ step_4_stage_opencode() {
     info "Staging dir: ${stage}"
 
     local url="https://github.com/sst/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz"
-    run curl -fL --output "${stage}/opencode-linux-x64.tar.gz" "${url}"
+    local _cx=()
+    [[ -n "${SITE_HTTP_PROXY}" ]] && _cx=(--proxy "${SITE_HTTP_PROXY}")
+    run curl -fL ${_cx[@]+"${_cx[@]}"} --output "${stage}/opencode-linux-x64.tar.gz" "${url}"
 
     # Verify the download against the in-repo provenance manifest before
     # extracting. See archive/opencode-${OPENCODE_VERSION}-provenance/README.md.
@@ -1086,19 +1152,38 @@ step_5_stage_install_tree() {
 # Step 6 — Drop the modulefile on the site MODULEPATH
 # ---------------------------------------------------------------------------
 
-step_6_drop_modulefile() {
-    section "Step 6/7 — Install modulefile to ${SITE_MODULES}/rocbudai/dev.lua"
+# Resolve MODULE_FLAVOR: "lmod" (dev.lua) or "tcl" (Tcl dev). "auto" sniffs the
+# environment (Lmod exports LMOD_*; Tcl Environment Modules export MODULES_CMD/
+# MODULESHOME), falling back to lmod. Sudo can scrub these — sites on Tcl should
+# set MODULE_FLAVOR=tcl in site.conf rather than relying on auto.
+resolve_module_flavor() {
+    case "${MODULE_FLAVOR}" in
+        lmod|tcl) printf '%s' "${MODULE_FLAVOR}"; return 0 ;;
+    esac
+    if [[ -n "${LMOD_CMD:-}${LMOD_DIR:-}${LMOD_VERSION:-}" ]] || command -v lmod >/dev/null 2>&1; then
+        printf 'lmod'
+    elif [[ -n "${MODULES_CMD:-}" ]] || command -v modulecmd >/dev/null 2>&1; then
+        printf 'tcl'
+    else
+        printf 'lmod'
+    fi
+}
 
-    local src="${INSTALL_ROOT}/modulefiles/rocbudai/dev.lua"
+step_6_drop_modulefile() {
+    local flavor; flavor="$(resolve_module_flavor)"
+    local modfile; [[ "${flavor}" == tcl ]] && modfile="dev" || modfile="dev.lua"
+    section "Step 6/7 — Install ${flavor} modulefile to ${SITE_MODULES}/rocbudai/${modfile}"
+
+    local src="${INSTALL_ROOT}/modulefiles/rocbudai/${modfile}"
     local dst_dir="${SITE_MODULES}/rocbudai"
-    local dst="${dst_dir}/dev.lua"
+    local dst="${dst_dir}/${modfile}"
+    [[ -f "${src}" ]] || die "Missing ${flavor} modulefile: ${src}"
 
     run_root mkdir -p "${dst_dir}"
     run_root cp "${src}" "${dst}"
     run_root chown root:root "${dst}"
 
-    # Re-target the modulefile if either path was overridden (matches the
-    # `sed -i` recipe in INSTALL.md §6).
+    # Path retargets are plain literal substitutions — flavour-agnostic.
     if [[ "${INSTALL_ROOT}" != "${INSTALL_ROOT_DEFAULT}" ]]; then
         info "Retargeting install root inside ${dst}"
         run_root sed -i "s|${INSTALL_ROOT_DEFAULT}|${INSTALL_ROOT}|g" "${dst}"
@@ -1110,48 +1195,56 @@ step_6_drop_modulefile() {
         run_root sed -i "s|${opencode_bin_default}|${opencode_bin_target}|g" "${dst}"
     fi
 
-    # Bake the site's Slurm partition(s) into ROCBUDAI_SPX_PARTITIONS so the
-    # modulefile (and thus the launcher/doctor) gates on the right partition.
+    # Value retargets use flavour-specific setenv syntax: Lmod setenv("K","V")
+    # vs Tcl rb_setenv K "V" (the Tcl helper that also records the launch env).
+    local sp_from sp_to sub_from sub_to mdl_from mdl_to allow_from allow_to
+    if [[ "${flavor}" == tcl ]]; then
+        sp_from='rb_setenv ROCBUDAI_SPX_PARTITIONS "[^"]*"'
+        sp_to="rb_setenv ROCBUDAI_SPX_PARTITIONS \"${SPX_PARTITIONS}\""
+        sub_from='rb_setenv ROCBUDAI_SUBMIT_PARTITION "[^"]*"'
+        sub_to="rb_setenv ROCBUDAI_SUBMIT_PARTITION \"${SUBMIT_PARTITION:-}\""
+        mdl_from="rb_setenv ROCBUDAI_MODEL ${MODEL_NAME_DEFAULT}"
+        mdl_to="rb_setenv ROCBUDAI_MODEL ${MODEL_NAME}"
+        allow_from='rb_setenv ROCBUDAI_ALLOWED_MODELS "'
+        allow_to="rb_setenv ROCBUDAI_ALLOWED_MODELS \"${MODEL_NAME},"
+    else
+        sp_from='setenv("ROCBUDAI_SPX_PARTITIONS", "[^"]*")'
+        sp_to="setenv(\"ROCBUDAI_SPX_PARTITIONS\", \"${SPX_PARTITIONS}\")"
+        sub_from='setenv("ROCBUDAI_SUBMIT_PARTITION", "[^"]*")'
+        sub_to="setenv(\"ROCBUDAI_SUBMIT_PARTITION\", \"${SUBMIT_PARTITION:-}\")"
+        mdl_from="setenv(\"ROCBUDAI_MODEL\", \"${MODEL_NAME_DEFAULT}\")"
+        mdl_to="setenv(\"ROCBUDAI_MODEL\", \"${MODEL_NAME}\")"
+        allow_from='setenv("ROCBUDAI_ALLOWED_MODELS", "'
+        allow_to="setenv(\"ROCBUDAI_ALLOWED_MODELS\", \"${MODEL_NAME},"
+    fi
+
+    # Bake the site's Slurm partition(s) so the modulefile (and thus the
+    # launcher/doctor) gates on the right partition.
     if [[ "${SPX_PARTITIONS}" != "${SPX_PARTITIONS_DEFAULT}" ]]; then
         info "Setting ROCBUDAI_SPX_PARTITIONS='${SPX_PARTITIONS}' inside ${dst}"
-        run_root sed -i "s|setenv(\"ROCBUDAI_SPX_PARTITIONS\", \"[^\"]*\")|setenv(\"ROCBUDAI_SPX_PARTITIONS\", \"${SPX_PARTITIONS}\")|" "${dst}"
+        run_root sed -i "s|${sp_from}|${sp_to}|" "${dst}"
     fi
 
-    # Bake the site's multi-GPU bench partition into ROCBUDAI_SUBMIT_PARTITION
-    # (empty => rocbudai-submit uses the cluster default partition).
+    # Bake the site's multi-GPU bench partition (empty => cluster default).
     if [[ -n "${SUBMIT_PARTITION:-}" ]]; then
         info "Setting ROCBUDAI_SUBMIT_PARTITION='${SUBMIT_PARTITION}' inside ${dst}"
-        run_root sed -i "s|setenv(\"ROCBUDAI_SUBMIT_PARTITION\", \"[^\"]*\")|setenv(\"ROCBUDAI_SUBMIT_PARTITION\", \"${SUBMIT_PARTITION}\")|" "${dst}"
+        run_root sed -i "s|${sub_from}|${sub_to}|" "${dst}"
     fi
 
-    # Bake the site's model into the modulefile default + allow-list so the
-    # pulled model and the module's default can't desync (single source:
-    # MODEL_NAME, from site.conf or --container).
+    # Bake the site's model into the default + allow-list so the pulled model
+    # and the module default can't desync (single source: MODEL_NAME).
     if [[ "${MODEL_NAME}" != "${MODEL_NAME_DEFAULT}" ]]; then
         info "Setting ROCBUDAI_MODEL='${MODEL_NAME}' inside ${dst}"
-        run_root sed -i "s|setenv(\"ROCBUDAI_MODEL\", \"${MODEL_NAME_DEFAULT}\")|setenv(\"ROCBUDAI_MODEL\", \"${MODEL_NAME}\")|" "${dst}"
-        run_root sed -i "s|setenv(\"ROCBUDAI_ALLOWED_MODELS\", \"|setenv(\"ROCBUDAI_ALLOWED_MODELS\", \"${MODEL_NAME},|" "${dst}"
+        run_root sed -i "s|${mdl_from}|${mdl_to}|" "${dst}"
+        run_root sed -i "s|${allow_from}|${allow_to}|" "${dst}"
     fi
 
-    # Bake the arch-specific AGENTS persona so the launcher seeds the right
-    # spec table + optimization playbooks. gfx942 is shared by MI300A (APU)
-    # and MI300X (discrete GPU); narrow it with detect_mi300a (a rocminfo
-    # APU-marker probe). The modulefile default is AGENTS-default.md (MI300A),
-    # so only re-target when it differs.
-    local persona="AGENTS-default.md"
-    case "${GFX_ARCH}" in
-        gfx90a) persona="AGENTS-gfx90a.md" ;;
-        gfx950) persona="AGENTS-gfx950.md" ;;
-        gfx942) detect_mi300a || persona="AGENTS-gfx942-mi300x.md" ;;
-    esac
-    if [[ "${persona}" != "AGENTS-default.md" ]]; then
-        info "AGENTS persona : ${persona} (gfx arch ${GFX_ARCH})"
-        run_root sed -i \
-            "s|setenv(\"ROCBUDAI_AGENTS_TEMPLATE\", pathJoin(root, \"share/rocbudai/AGENTS-default.md\"))|setenv(\"ROCBUDAI_AGENTS_TEMPLATE\", pathJoin(root, \"share/rocbudai/${persona}\"))|" \
-            "${dst}"
-    else
-        info "AGENTS persona : AGENTS-default.md (MI300A)"
-    fi
+    # AGENTS persona is intentionally NOT baked: install.sh commonly stages the
+    # shared tree from a GPU-less login node, so any install-time arch guess is
+    # unreliable. rocbudai-tui resolves it at launch from the live GPU on the
+    # compute node (see _persona_for_arch), honouring a ROCBUDAI_AGENTS_TEMPLATE
+    # override.
+    info "AGENTS persona : resolved at runtime by rocbudai-tui (not baked)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1295,8 +1388,16 @@ step_8_airgap() {
     run_root install -m 0644 -o root -g root "${d}/ollama-egress.nft" /etc/nftables.d/ollama-egress.nft
     run_root install -m 0644 -o root -g root "${d}/ollama-egress.service" /etc/systemd/system/ollama-egress.service
 
+    # Per-job user-UID egress skeleton. Loads the (empty) inet rocbudai_user_egress
+    # table at boot; the Slurm egress prolog (step_8_comment_gating) adds a per-job
+    # jump chain scoped to the user's UID. Without this table loaded, that prolog
+    # fails CLOSED (aborts the job) and rocbudai-airgap-check section 6 stays red.
+    run_root install -m 0644 -o root -g root "${d}/rocbudai-user-egress.nft" /etc/nftables.d/rocbudai-user-egress.nft
+    run_root install -m 0644 -o root -g root "${d}/rocbudai-user-egress.service" /etc/systemd/system/rocbudai-user-egress.service
+
     run_root systemctl daemon-reload
     run_root systemctl enable --now ollama-egress.service
+    run_root systemctl enable --now rocbudai-user-egress.service
 }
 
 step_8_auto_ingest() {
@@ -1600,10 +1701,178 @@ INNER
 }
 
 # ---------------------------------------------------------------------------
+# Provisioning image-bake mode (--image-bake <chroot>)
+# ---------------------------------------------------------------------------
+#
+# Lays the PER-NODE ollama/rocBudAI pieces FLAT into an image chroot and
+# offline-enables the boot-time services. It performs NO live operations — no
+# `systemctl daemon-reload/start/restart`, no `--now`, no `ollama pull` —
+# because a chroot has no PID-1 systemd and no GPU. Everything that needs a
+# running daemon happens at first boot on a real node; the model already lives
+# on the shared NFS store, so there is nothing to pull per image.
+#
+# NOT baked: the shared components (opencode, install tree, modulefile) — they
+# live on the NFS share and are installed once with a normal run.
+run_image_bake() {
+    local R="${IMAGE_BAKE_CHROOT%/}"
+    section "Image-bake mode — flat laydown into ${R}"
+    warn "Flat bake only: no services are started, no systemd reload, no model"
+    warn "pull. Live steps happen at first boot on a real node."
+
+    [[ -n "${R}" ]] || die "--image-bake requires a chroot path."
+    [[ -d "${R}" ]] || die "chroot '${R}' does not exist."
+    [[ -d "${R}/etc" && -d "${R}/usr" ]] || \
+        die "'${R}' does not look like a root filesystem (missing etc/ or usr/)."
+    command -v systemctl >/dev/null 2>&1 || \
+        die "systemctl not found on this host — needed for offline 'systemctl --root enable'."
+
+    local dd="${REPO_ROOT}/deploy/ollama-daemon"
+    local mc="${REPO_ROOT}/deploy/model-cache"
+    [[ -f "${dd}/ollama.service" ]] || die "missing ${dd}/ollama.service"
+    [[ -f "${mc}/rocbudai-model-cache.service" ]] || die "missing ${mc}/rocbudai-model-cache.service"
+
+    # 1. ollama service user/group (offline via useradd --root). The unit's
+    #    SupplementaryGroups=render video are added by systemd at runtime, so we
+    #    only need the primary ollama user/group in the image.
+    section "1/5 — ollama service user"
+    run_root_sh "grep -q '^ollama:' '${R}/etc/group'  || groupadd -R '${R}' -r ollama"
+    run_root_sh "grep -q '^ollama:' '${R}/etc/passwd' || useradd  -R '${R}' -r -g ollama -s /usr/sbin/nologin -d /usr/share/ollama ollama"
+
+    # 2. ollama.service + optional site proxy drop-in
+    section "2/5 — ollama unit + proxy drop-in"
+    run_root install -D -m 0644 -o root -g root "${dd}/ollama.service" "${R}/etc/systemd/system/ollama.service"
+    run_root install -d -m 0755 "${R}/etc/systemd/system/ollama.service.d"
+    if [[ -n "${SITE_HTTP_PROXY}" ]]; then
+        local ptmp; ptmp="$(mktemp)"
+        {
+            echo "[Service]"
+            echo "Environment=\"HTTP_PROXY=${SITE_HTTP_PROXY}\""
+            echo "Environment=\"HTTPS_PROXY=${SITE_HTTP_PROXY}\""
+            echo "Environment=\"NO_PROXY=${SITE_NO_PROXY}\""
+        } >"${ptmp}"
+        run_root install -m 0644 -o root -g root "${ptmp}" "${R}/etc/systemd/system/ollama.service.d/10-proxy.conf"
+        rm -f "${ptmp}"
+        info "proxy drop-in: HTTP(S)_PROXY=${SITE_HTTP_PROXY} NO_PROXY=${SITE_NO_PROXY}"
+    else
+        info "SITE_HTTP_PROXY empty — skipping proxy drop-in (direct egress)."
+    fi
+
+    # 3. Static GPU/CPU split. ROCR_VISIBLE_DEVICES (LLM on dies 0..N-2) is safe
+    #    to derive from the die count alone; AllowedCPUs is NUMA-topology-
+    #    specific, so it is only written when IMAGE_ALLOWED_CPUS is supplied.
+    section "3/5 — GPU/CPU split drop-in"
+    if [[ "${IMAGE_GPU_COUNT}" -ge 2 ]]; then
+        local llm="" i
+        for ((i=0; i<IMAGE_GPU_COUNT-1; i++)); do llm+="${llm:+,}$i"; done
+        local gtmp; gtmp="$(mktemp)"
+        {
+            echo "[Service]"
+            echo "Environment=\"ROCR_VISIBLE_DEVICES=${llm}\""
+            [[ -n "${IMAGE_ALLOWED_CPUS}" ]] && echo "AllowedCPUs=${IMAGE_ALLOWED_CPUS}"
+        } >"${gtmp}"
+        run_root install -m 0644 -o root -g root "${gtmp}" "${R}/etc/systemd/system/ollama.service.d/10-gpu-split.conf"
+        rm -f "${gtmp}"
+        info "GPU split: ROCR_VISIBLE_DEVICES=${llm} (rocbudai-bench GPU=$((IMAGE_GPU_COUNT-1)))"
+        [[ -n "${IMAGE_ALLOWED_CPUS}" ]] && info "AllowedCPUs=${IMAGE_ALLOWED_CPUS}" || \
+            warn "AllowedCPUs not set (GPU isolation only). To add CPU pinning: run libexec/rocbudai-detect-topology.sh on a booted node, set IMAGE_ALLOWED_CPUS, re-bake."
+    else
+        info "IMAGE_GPU_COUNT<2 — skipping GPU split (LLM + bench share all GPUs)."
+    fi
+
+    # 4. NVMe model cache (unit + drop-in), retargeted to this site's paths.
+    section "4/5 — NVMe model cache"
+    run_root install -D -m 0644 -o root -g root "${mc}/rocbudai-model-cache.service" "${R}/etc/systemd/system/rocbudai-model-cache.service"
+    run_root install -D -m 0644 -o root -g root "${mc}/ollama-models-cache.conf"     "${R}/etc/systemd/system/ollama.service.d/model-cache.conf"
+    if [[ "${MODEL_CACHE_DIR}" != "${MODEL_CACHE_DIR_DEFAULT}" ]]; then
+        info "Retargeting model cache dir → ${MODEL_CACHE_DIR}"
+        run_root sed -i "s#${MODEL_CACHE_DIR_DEFAULT}#${MODEL_CACHE_DIR}#g" \
+            "${R}/etc/systemd/system/rocbudai-model-cache.service" \
+            "${R}/etc/systemd/system/ollama.service.d/model-cache.conf"
+    fi
+    if [[ "${MODELS_DIR}" != "${MODELS_DIR_SHIPPED}" ]]; then
+        info "Retargeting model-cache rsync source → ${MODELS_DIR}"
+        run_root sed -i "s#${MODELS_DIR_SHIPPED}#${MODELS_DIR}#g" \
+            "${R}/etc/systemd/system/rocbudai-model-cache.service"
+    fi
+    run_root install -d -m 0755 "${R}${MODEL_CACHE_DIR}"
+
+    # NVMe mount point + a DISABLED example .mount stub. The device/filesystem is
+    # site-specific (and formatting is destructive), so we never guess it — the
+    # admin fills What= and enables it. cache_mnt is the parent of the cache dir.
+    local cache_mnt="${MODEL_CACHE_DIR%/*}"
+    run_root install -d -m 0755 "${R}${cache_mnt}"
+    local munit
+    munit="$(systemd-escape -p --suffix=mount "${cache_mnt}" 2>/dev/null || echo "$(echo "${cache_mnt}" | sed 's#^/##; s#/#-#g').mount")"
+    local mtmp; mtmp="$(mktemp)"
+    {
+        echo "# EXAMPLE local-NVMe mount for the rocBudAI model cache (DISABLED)."
+        echo "# The NVMe device + filesystem are node-specific and formatting is"
+        echo "# destructive, so set What= yourself, then enable in the chroot:"
+        echo "#   sudo systemctl --root=${R} enable ${munit}"
+        echo "[Unit]"
+        echo "Description=rocBudAI model-cache scratch (${cache_mnt})"
+        echo "Before=rocbudai-model-cache.service"
+        echo ""
+        echo "[Mount]"
+        echo "What=/dev/disk/by-label/ROCBUDAI_CACHE   # TODO set to this node's NVMe"
+        echo "Where=${cache_mnt}"
+        echo "Type=ext4"
+        echo "Options=defaults,noatime"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=multi-user.target"
+    } >"${mtmp}"
+    run_root install -m 0644 -o root -g root "${mtmp}" "${R}/etc/systemd/system/${munit}.example"
+    rm -f "${mtmp}"
+    info "wrote DISABLED mount stub: /etc/systemd/system/${munit}.example (set What=, drop .example, enable)"
+
+    # 5. Offline-enable boot services (creates .wants symlinks only; no activation).
+    section "5/5 — offline enable (symlinks only, no activation)"
+    run_root systemctl --root="${R}" enable rocbudai-model-cache.service
+    if [[ "${IMAGE_ENABLE_OLLAMA}" == "1" ]]; then
+        run_root systemctl --root="${R}" enable ollama.service
+        info "ollama.service enabled at boot."
+    else
+        info "ollama.service left DISABLED (IMAGE_ENABLE_OLLAMA=0) — the Slurm --comment=ollama prolog starts it per job."
+    fi
+
+    # Optional: rebuild the Warewulf image if wwctl is available.
+    if command -v wwctl >/dev/null 2>&1; then
+        local img
+        if [[ "$(basename "${R}")" == "rootfs" ]]; then
+            img="$(basename "$(dirname "${R}")")"
+        else
+            img="$(basename "${R}")"
+        fi
+        if confirm "Run 'wwctl container build ${img}' now?"; then
+            run_root wwctl container build "${img}"
+        else
+            info "Skipped image build. When ready: sudo wwctl container build ${img}"
+        fi
+    else
+        info "wwctl not found — rebuild the image with your provisioning tool to pick up these files."
+    fi
+
+    section "Image-bake done"
+    ok "Baked ollama + model-cache into ${R} (flat, offline-enabled)."
+    info "Still required (once, off-image):"
+    info "  - mount an NVMe at ${cache_mnt} on the nodes (customize the .mount stub)."
+    info "  - model already on the NFS store (${MODELS_DIR}); no per-image pull."
+    info "  - shared components (opencode, install tree, modulefile) install once on NFS via a normal run."
+    [[ "${IMAGE_ENABLE_OLLAMA}" == "1" ]] || \
+        info "  - wire the Slurm --comment=ollama prolog/epilog on slurmctld (see deploy/comment-gating)."
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 main() {
+    if [[ ${IMAGE_BAKE} -eq 1 ]]; then
+        run_image_bake
+        exit $?
+    fi
+
     if [[ ${CONTAINER} -eq 1 ]]; then
         run_container_mode
         exit $?

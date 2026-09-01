@@ -16,6 +16,18 @@ OPENCODE_ROOT="/shared/apps/ubuntu/opt/opencode"
 OPENCODE_VERSION="1.14.28"
 SITE_MODULES="/shared/apps/modules/ubuntu/lmodfiles/base"
 
+# Module system flavour. "auto" detects Lmod vs Environment Modules (Tcl) at
+# step 6; set "lmod" (installs dev.lua) or "tcl" (installs the Tcl dev, for
+# Environment Modules / Cray PE) explicitly if auto-detection under sudo fails.
+MODULE_FLAVOR="auto"
+
+# --- outbound proxy (install-time fetches) ----------------------------------
+# Set if compute nodes reach the internet only via an HTTP(S) proxy. Applied to
+# the ollama vendor installer, the opencode download, AND a systemd drop-in so
+# the daemon (which performs `ollama pull`) uses it. "" = direct egress.
+SITE_HTTP_PROXY=""
+SITE_NO_PROXY="localhost,127.0.0.1"
+
 # Warewulf image rootfs (only used by the step-2 sidecar that bakes the ollama
 # unit into the compute-node image; ignore/leave empty if you deploy
 # differently). The image NAME for `wwctl container build` is derived from this
@@ -51,6 +63,16 @@ MODEL_CACHE_DIR="/var/local/cache/ollama"
 # NOTE: the agent-side path is ALSO baked into the AGENTS personas + README,
 # which install.sh does NOT rewrite — a relocated KB needs those edited too.
 KB_INPUTS_DIR="/shareddata/rocbudai/docs/inputs"
+
+# --- provisioning image-bake knobs (only used by --image-bake CHROOT) -------
+# GPU dies per node (computes the static LLM/bench split; <2 skips it).
+IMAGE_GPU_COUNT=4
+# systemd AllowedCPUs= for the LLM dies. "" = GPU isolation only. NUMA layout is
+# node-specific: derive on a booted node with libexec/rocbudai-detect-topology.sh.
+IMAGE_ALLOWED_CPUS=""
+# 1 = enable ollama.service at boot in the image; 0 = leave disabled so the
+# --comment=ollama Slurm prolog starts it per job.
+IMAGE_ENABLE_OLLAMA=1
 
 # --- NOT set here (single source of truth lives elsewhere, by design) -------
 # * Ollama model store path  -> Environment="OLLAMA_MODELS=..." in

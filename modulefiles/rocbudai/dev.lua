@@ -140,20 +140,11 @@ setenv("ROCBUDAI_SPX_PARTITIONS", "PPAC_MI300A_SPX")
 -- rocbudai-submit multi-GPU bench partition; "" => cluster default.
 setenv("ROCBUDAI_SUBMIT_PARTITION", "")
 
--- Arch-specific AGENTS persona. install.sh resolves this from --gfx-arch /
--- autodetect (narrowing gfx942 to MI300A APU vs MI300X discrete via
--- detect_mi300a) and re-targets the path below to the matching file:
---   AGENTS-default.md         MI300A  (gfx942, CDNA3 APU)
---   AGENTS-gfx942-mi300x.md   MI300X  (gfx942, CDNA3 discrete)
---   AGENTS-gfx90a.md          MI250X / MI210 (gfx90a, CDNA2)
---   AGENTS-gfx950.md          MI355X / MI350X (gfx950, CDNA4)
--- rocbudai-tui seeds this file as the session AGENTS.md (in container
--- quick-test mode it instead uses the standalone AGENTS-container-demo.md).
--- Honour a user export so power users can force a persona:
+-- AGENTS persona is resolved at runtime by rocbudai-tui from the live GPU on the
+-- compute node (see _persona_for_arch), so it is NOT baked here. rocbudai-tui
+-- seeds the matching file as the session AGENTS.md (container quick-test mode
+-- uses the standalone AGENTS-container-demo.md). A user may still force one:
 --   export ROCBUDAI_AGENTS_TEMPLATE=<file>; module load rocbudai
-if os.getenv("ROCBUDAI_AGENTS_TEMPLATE") == nil or os.getenv("ROCBUDAI_AGENTS_TEMPLATE") == "" then
-    setenv("ROCBUDAI_AGENTS_TEMPLATE", pathJoin(root, "share/rocbudai/AGENTS-default.md"))
-end
 
 -- Auto-launch the TUI on compute nodes with an interactive TTY (recursion-
 -- guarded by ROCBUDAI_ACTIVE). The actual logic lives in a real shell script
