@@ -39,6 +39,12 @@ set_rocminfo "  Marketing Name:  AMD Instinct MI300A"
 check "gfx942 + APU -> MI300A" "AGENTS-default.md" "$(ROCBUDAI_GFX_ARCH=gfx942 _persona_for_arch)"
 set_rocminfo "  Marketing Name:  AMD Instinct MI300X"
 check "gfx942 discrete -> MI300X" "AGENTS-gfx942-mi300x.md" "$(ROCBUDAI_GFX_ARCH=gfx942 _persona_for_arch)"
+# Regression: a truncated rocminfo snapshot that keeps the gfx942 arch line but
+# loses the Marketing Name must FAIL SAFE to MI300A, never MI300X (the race that
+# mis-seeded the discrete persona on an MI300A APU under GPU load).
+set_rocminfo "  Name:    gfx942"
+check "gfx942 truncated snapshot -> MI300A fail-safe" "AGENTS-default.md" "$(unset ROCBUDAI_GFX_ARCH; _persona_for_arch)"
+check "gfx942 truncated snapshot (hinted) -> MI300A fail-safe" "AGENTS-default.md" "$(ROCBUDAI_GFX_ARCH=gfx942 _persona_for_arch)"
 set_rocminfo "  Name:    gfx950"
 check "autodetect gfx950" "AGENTS-gfx950.md" "$(unset ROCBUDAI_GFX_ARCH; _persona_for_arch)"
 set_rocminfo "  Name:    gfx90a"

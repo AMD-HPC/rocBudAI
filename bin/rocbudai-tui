@@ -48,29 +48,31 @@ ROCBUDAI_AGENTS_TEMPLATE="${ROCBUDAI_AGENTS_TEMPLATE:-}"
 ROCBUDAI_CONTAINER_DEMO_PERSONA="${ROCBUDAI_CONTAINER_DEMO_PERSONA:-${ROCBUDAI_SHARE}/AGENTS-container-demo.md}"
 
 # >>> rocbudai persona-resolver (sourceable for tests; see tests/test-persona-resolver.sh) >>>
-# Echo the first GPU agent's gfx arch (gfx90a|gfx942|gfx950) from rocminfo,
-# or nothing if rocminfo is unavailable / no match.
-_detect_gfx_arch() {
-    command -v rocminfo >/dev/null 2>&1 || return 1
-    rocminfo 2>/dev/null | grep -oE 'gfx(90a|942|950)' | head -n1
-}
-
-# gfx942 is shared by MI300A (APU) and MI300X (discrete GPU). Narrow via the
-# rocminfo Marketing Name / APU marker (mirrors install.sh detect_mi300a).
-_is_mi300a_apu() {
-    command -v rocminfo >/dev/null 2>&1 || return 1
-    rocminfo 2>/dev/null | grep -qiE 'Marketing Name:.*MI300A|APU'
-}
-
 # Echo the persona basename matching the detected (or hinted) GPU arch.
+#
+# Takes a SINGLE rocminfo snapshot and derives both the gfx arch and the
+# MI300A/MI300X split from that one snapshot. Previously two independent
+# rocminfo calls (arch detect + APU probe) could disagree when rocminfo output
+# was truncated under load (e.g. the ollama daemon saturating the GPUs during
+# `module load`): the arch call still returned gfx942 while the APU call came
+# back empty, so gfx942 fell through to the MI300X persona on an MI300A APU.
+#
+# For gfx942 (shared by MI300A APU and MI300X discrete GPU) we now select the
+# MI300X persona only on a POSITIVE discrete match and otherwise FAIL SAFE to
+# the MI300A persona, so a partial/empty snapshot can never mis-pick MI300X.
 _persona_for_arch() {
     local arch="${ROCBUDAI_GFX_ARCH:-}"
-    [[ -n "${arch}" ]] || arch="$(_detect_gfx_arch || true)"
+    local ri=""
+    command -v rocminfo >/dev/null 2>&1 && ri="$(rocminfo 2>/dev/null)"
+    [[ -n "${arch}" ]] || arch="$(printf '%s\n' "${ri}" | grep -oE 'gfx(90a|942|950)' | head -n1)"
     case "${arch}" in
         gfx90a) echo "AGENTS-gfx90a.md" ;;
         gfx950) echo "AGENTS-gfx950.md" ;;
-        gfx942) if _is_mi300a_apu; then echo "AGENTS-default.md"
-                else echo "AGENTS-gfx942-mi300x.md"; fi ;;
+        gfx942) if printf '%s\n' "${ri}" | grep -qiE 'Marketing Name:.*MI300X'; then
+                    echo "AGENTS-gfx942-mi300x.md"
+                else
+                    echo "AGENTS-default.md"
+                fi ;;
         *)      warn "could not determine GPU arch (got '${arch:-none}'); defaulting to the MI300A persona — set ROCBUDAI_GFX_ARCH=gfx90a|gfx942|gfx950 or ROCBUDAI_AGENTS_TEMPLATE to override."
                 echo "AGENTS-default.md" ;;
     esac
