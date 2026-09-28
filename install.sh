@@ -104,13 +104,10 @@ MODEL_CACHE_DIR="/var/local/cache/ollama"
 KB_INPUTS_DIR="/shareddata/rocbudai/docs/inputs"
 
 # --- Provisioning image-bake knobs (--image-bake CHROOT) -------------------
-# GPU dies per node; used to compute the static LLM/bench GPU split
-# (LLM on dies 0..N-2, rocbudai-bench on die N-1). <2 skips the split.
-IMAGE_GPU_COUNT=4
-# systemd AllowedCPUs= for the LLM dies. Empty = GPU isolation only (safe);
-# NUMA topology is node-specific, so derive it on a booted node with
-# libexec/rocbudai-detect-topology.sh (its ROCBUDAI_LLM_CPUS value) and set here.
-IMAGE_ALLOWED_CPUS=""
+# The GPU fence is NOT baked (no IMAGE_GPU_COUNT/IMAGE_ALLOWED_CPUS): it is
+# written per job on the booted node by the --comment=ollama prolog via
+# libexec/rocbudai-detect-topology.sh --write-fence, so it adapts to the node's
+# real GPU arch/count instead of a static die guess baked at image time.
 # 1 = enable ollama.service at boot in the image; 0 = leave disabled so the
 # --comment=ollama Slurm prolog starts it per job.
 IMAGE_ENABLE_OLLAMA=1
@@ -242,7 +239,7 @@ Options:
                       node (the model already lives on the NFS store). Bakes the
                       ollama unit + optional proxy drop-in + static GPU split +
                       NVMe model-cache + the 'ollama' user. Tunables:
-                      IMAGE_GPU_COUNT, IMAGE_ALLOWED_CPUS, IMAGE_ENABLE_OLLAMA
+                      IMAGE_ENABLE_OLLAMA
                       (see CONFIGURATION). Shared components (opencode/tree/
                       modulefile) are NOT baked; install them once on the NFS
                       share with a normal run.
@@ -965,37 +962,16 @@ configure_gpu_split() {
         return 0
     fi
 
-    section "Step 2b/7 — Reserve one GPU for rocbudai-bench"
+    section "Step 2b/7 — Reserve GPU(s) for rocbudai-bench"
 
-    local topo
-    topo="$(bash "${REPO_ROOT}/libexec/rocbudai-detect-topology.sh" 2>/dev/null || true)"
-    local ROCBUDAI_GPU_COUNT="" ROCBUDAI_LLM_DEVICES="" ROCBUDAI_BENCH_GPU=""
-    local ROCBUDAI_LLM_CPUS="" ROCBUDAI_BENCH_CPUS=""
-    eval "${topo}"
+    # Single source of truth: the topology helper writes the fence drop-in from
+    # this node's live GPUs — the SAME values rocbudai-bench reads and the SAME
+    # call the Slurm ollama prolog makes (libexec/rocbudai-detect-topology.sh
+    # --write-fence). It reserves a whole OAM on multi-GCD parts (gfx90a) and a
+    # single die elsewhere, and clears the fence when <2 GPUs are present.
+    run_root bash "${REPO_ROOT}/libexec/rocbudai-detect-topology.sh" --write-fence \
+        || warn "GPU fence write failed."
 
-    if [[ "${ROCBUDAI_GPU_COUNT:-0}" -lt 2 ]]; then
-        warn "Detected ${ROCBUDAI_GPU_COUNT:-0} GPU(s); need >=2 to reserve a bench GPU — skipping fencing."
-        return 0
-    fi
-
-    info "LLM GPUs: ${ROCBUDAI_LLM_DEVICES}   bench GPU: ${ROCBUDAI_BENCH_GPU}"
-    local dropin="/etc/systemd/system/ollama.service.d/10-gpu-split.conf"
-    local tmp
-    tmp="$(mktemp)"
-    {
-        echo "[Service]"
-        echo "Environment=\"ROCR_VISIBLE_DEVICES=${ROCBUDAI_LLM_DEVICES}\""
-        if [[ -n "${ROCBUDAI_LLM_CPUS}" ]]; then
-            echo "AllowedCPUs=${ROCBUDAI_LLM_CPUS}"
-        fi
-    } > "${tmp}"
-    if [[ -z "${ROCBUDAI_LLM_CPUS}" ]]; then
-        warn "CPU topology not cleanly derivable — GPU isolation only (no AllowedCPUs)."
-    fi
-    run_root install -D -m 0644 -o root -g root "${tmp}" "${dropin}"
-    rm -f "${tmp}"
-
-    run_root systemctl daemon-reload
     run_root systemctl restart ollama
 }
 
@@ -1362,6 +1338,12 @@ step_8_comment_gating() {
     run_root install -m 0755 -o root -g root "${d}/rocbudai-egress-prolog.sh" "${prolog_dir}/rocbudai-egress-prolog.sh"
     run_root install -m 0755 -o root -g root "${d}/rocbudai-egress-epilog.sh" "${epilog_dir}/rocbudai-egress-epilog.sh"
     run_root install -m 0644 -o root -g root "${d}/job_submit.lua"             "${slurm_etc}/job_submit.lua"
+
+    # Retarget the detect-topology path baked into the ollama prolog (it writes
+    # the GPU fence at job start) to this site's INSTALL_ROOT.
+    if [[ "${INSTALL_ROOT}" != "${INSTALL_ROOT_DEFAULT}" ]]; then
+        run_root sed -i "s#${INSTALL_ROOT_DEFAULT}#${INSTALL_ROOT}#g" "${prolog_dir}/rocbudai-ollama-prolog.sh"
+    fi
 
     warn "Manual step still required:"
     warn "  Add the dispatch blocks shown in deploy/comment-gating/README.md to"
@@ -1757,27 +1739,11 @@ run_image_bake() {
         info "SITE_HTTP_PROXY empty — skipping proxy drop-in (direct egress)."
     fi
 
-    # 3. Static GPU/CPU split. ROCR_VISIBLE_DEVICES (LLM on dies 0..N-2) is safe
-    #    to derive from the die count alone; AllowedCPUs is NUMA-topology-
-    #    specific, so it is only written when IMAGE_ALLOWED_CPUS is supplied.
-    section "3/5 — GPU/CPU split drop-in"
-    if [[ "${IMAGE_GPU_COUNT}" -ge 2 ]]; then
-        local llm="" i
-        for ((i=0; i<IMAGE_GPU_COUNT-1; i++)); do llm+="${llm:+,}$i"; done
-        local gtmp; gtmp="$(mktemp)"
-        {
-            echo "[Service]"
-            echo "Environment=\"ROCR_VISIBLE_DEVICES=${llm}\""
-            [[ -n "${IMAGE_ALLOWED_CPUS}" ]] && echo "AllowedCPUs=${IMAGE_ALLOWED_CPUS}"
-        } >"${gtmp}"
-        run_root install -m 0644 -o root -g root "${gtmp}" "${R}/etc/systemd/system/ollama.service.d/10-gpu-split.conf"
-        rm -f "${gtmp}"
-        info "GPU split: ROCR_VISIBLE_DEVICES=${llm} (rocbudai-bench GPU=$((IMAGE_GPU_COUNT-1)))"
-        [[ -n "${IMAGE_ALLOWED_CPUS}" ]] && info "AllowedCPUs=${IMAGE_ALLOWED_CPUS}" || \
-            warn "AllowedCPUs not set (GPU isolation only). To add CPU pinning: run libexec/rocbudai-detect-topology.sh on a booted node, set IMAGE_ALLOWED_CPUS, re-bake."
-    else
-        info "IMAGE_GPU_COUNT<2 — skipping GPU split (LLM + bench share all GPUs)."
-    fi
+    # 3. GPU/CPU fence: NOT baked into the image. It is written per job on the
+    #    booted node by the --comment=ollama Slurm prolog, which calls
+    #    libexec/rocbudai-detect-topology.sh --write-fence — the SAME engine
+    #    rocbudai-bench reads, so the fence adapts to the node's real GPU
+    #    arch/count (e.g. a whole OAM on gfx90a) rather than a static die guess.
 
     # 4. NVMe model cache (unit + drop-in), retargeted to this site's paths.
     section "4/5 — NVMe model cache"

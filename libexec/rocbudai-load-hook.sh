@@ -34,7 +34,7 @@ fi
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     echo "[rocBudAI] this module is for compute nodes; you are on a login node." >&2
-    echo "[rocBudAI] allocate a compute node first (-p selects the SPX MI300A" >&2
+    echo "[rocBudAI] allocate a compute node first (-p selects the SPX" >&2
     echo "[rocBudAI] partition; --comment=ollama starts the ollama daemon):" >&2
     echo "[rocBudAI]   salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama --time=01:00:00" >&2
     echo "[rocBudAI] then on the compute node prompt:" >&2

@@ -56,6 +56,42 @@ SYS_KFD="${ROCBUDAI_SYSFS_KFD:-/sys/class/kfd/kfd/topology/nodes}"
 SYS_DRM="${ROCBUDAI_SYSFS_DRM:-/sys/class/drm}"
 SYS_NODE="${ROCBUDAI_SYSFS_NODE:-/sys/devices/system/node}"
 
+# Optional actuation: with --write-fence we also write the ollama systemd
+# drop-in (ROCR_VISIBLE_DEVICES [+ AllowedCPUs]) from the values computed below,
+# so the SAME engine bench reads also lays down the fence — one code path, no
+# drift. Bare invocation just prints the KEY=VALUE topology (bench/install use).
+WRITE_FENCE=0
+FENCE_DROPIN="${ROCBUDAI_GPU_SPLIT_DROPIN:-/etc/systemd/system/ollama.service.d/10-gpu-split.conf}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --write-fence) WRITE_FENCE=1 ;;
+        --dropin)      FENCE_DROPIN="${2:?--dropin needs a path}"; shift ;;
+        *)             : ;;
+    esac
+    shift
+done
+
+# Trailing GCDs reserved for rocbudai-bench. gfx90a (MI250X) packs 2 GCDs per
+# OAM that share one power/thermal package, so reserve a whole OAM (1 benched, 1
+# idle); every other arch is one ROCr device per package -> reserve 1. Arch is
+# read from sysfs KFD gfx_target_version (90010=gfx90a), which needs NO rocm
+# module or PATH, so install-time, the Slurm prolog, and bench all agree on the
+# same count. rocminfo is only a fallback for kernels missing that field.
+reserve_gcds() {
+    local p vals sc gv
+    for p in "${SYS_KFD}"/*/properties; do
+        [[ -r "$p" ]] || continue
+        vals="$(awk '/^simd_count/{s=$2} /^gfx_target_version/{g=$2} END{printf "%d %d", s+0, g+0}' "$p" 2>/dev/null)"
+        sc="${vals%% *}"; gv="${vals##* }"
+        [[ "${sc:-0}" -gt 0 ]] || continue
+        [[ "${gv:-0}" -eq 90010 ]] && { echo 2; return; }
+        echo 1; return
+    done
+    command -v rocminfo >/dev/null 2>&1 \
+        && rocminfo 2>/dev/null | grep -qE 'Name:[[:space:]]+gfx90a' && { echo 2; return; }
+    echo 1
+}
+
 count_gpus() {
     local n
     if command -v rocm-smi >/dev/null 2>&1; then
@@ -139,6 +175,8 @@ GPU_COUNT="$(count_gpus)"
 GPU_COUNT="${GPU_COUNT:-0}"
 NUMA_COUNT="$(count_numa_nodes)"
 NUMA_COUNT="${NUMA_COUNT:-0}"
+RESERVE_GCDS="$(reserve_gcds)"
+LLM_COUNT=$((GPU_COUNT - RESERVE_GCDS))
 
 LLM_DEVICES=""
 BENCH_GPU=""
@@ -146,9 +184,9 @@ LLM_CPUS=""
 BENCH_CPUS=""
 TOPO_METHOD="none"
 
-if [[ "$GPU_COUNT" -ge 2 ]]; then
-    BENCH_GPU=$((GPU_COUNT - 1))
-    for ((i = 0; i < GPU_COUNT - 1; i++)); do
+if [[ "$GPU_COUNT" -gt "$RESERVE_GCDS" ]]; then
+    BENCH_GPU=$LLM_COUNT
+    for ((i = 0; i < LLM_COUNT; i++)); do
         LLM_DEVICES="${LLM_DEVICES:+${LLM_DEVICES},}${i}"
     done
 
@@ -160,7 +198,7 @@ if [[ "$GPU_COUNT" -ge 2 ]]; then
     resolved=1
     bench_node="$(numa_of_device "$BENCH_GPU")"
     if [[ -n "$bench_node" ]]; then
-        for ((i = 0; i < GPU_COUNT - 1; i++)); do
+        for ((i = 0; i < LLM_COUNT; i++)); do
             nn="$(numa_of_device "$i")"
             if [[ -z "$nn" || "$nn" == "$bench_node" ]]; then resolved=0; break; fi
             case " $llm_nodes " in *" $nn "*) : ;; *) llm_nodes="${llm_nodes} ${nn}" ;; esac
@@ -177,7 +215,7 @@ if [[ "$GPU_COUNT" -ge 2 ]]; then
         # kernels that no longer expose device/numa_node for every render node.
         bench_node="$BENCH_GPU"
         llm_nodes=""
-        for ((i = 0; i < GPU_COUNT - 1; i++)); do
+        for ((i = 0; i < LLM_COUNT; i++)); do
             llm_nodes="${llm_nodes} ${i}"
         done
         TOPO_METHOD="identity"
@@ -206,3 +244,21 @@ echo "ROCBUDAI_BENCH_GPU=${BENCH_GPU}"
 echo "ROCBUDAI_LLM_CPUS=${LLM_CPUS}"
 echo "ROCBUDAI_BENCH_CPUS=${BENCH_CPUS}"
 echo "ROCBUDAI_TOPO_METHOD=${TOPO_METHOD}"
+
+# --write-fence: lay down (or clear) the ollama GPU/CPU fence drop-in from the
+# values above. This is the ONE place the fence file is written; the Slurm
+# ollama prolog and install.sh call this rather than hand-rolling the drop-in.
+if [[ "$WRITE_FENCE" -eq 1 ]]; then
+    if [[ "${GPU_COUNT}" -lt 2 || -z "${LLM_DEVICES}" ]]; then
+        rm -f "${FENCE_DROPIN}" 2>/dev/null || true
+    else
+        mkdir -p "$(dirname "${FENCE_DROPIN}")" 2>/dev/null || true
+        {
+            echo "[Service]"
+            echo "Environment=\"ROCR_VISIBLE_DEVICES=${LLM_DEVICES}\""
+            [[ -n "${LLM_CPUS}" ]] && echo "AllowedCPUs=${LLM_CPUS}"
+        } > "${FENCE_DROPIN}"
+        chmod 0644 "${FENCE_DROPIN}" 2>/dev/null || true
+    fi
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+fi

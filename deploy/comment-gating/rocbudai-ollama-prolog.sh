@@ -54,6 +54,11 @@ ROCBUDAI_PREWARM_MODEL="${ROCBUDAI_PREWARM_MODEL:-qwen3.5:122b}"
 # and the Python proxy to 127.0.0.1:11434; that's what users hit.
 ROCBUDAI_PROXY_URL="${ROCBUDAI_PROXY_URL:-http://127.0.0.1:11434}"
 
+# Topology helper that writes the ollama GPU fence from THIS node's live GPUs
+# (the SAME engine rocbudai-bench reads). install.sh --with-comment-gating
+# rewrites the /shared/apps/ubuntu/opt/rocbudai prefix to the site INSTALL_ROOT.
+ROCBUDAI_DETECT_TOPOLOGY="${ROCBUDAI_DETECT_TOPOLOGY:-/shared/apps/ubuntu/opt/rocbudai/libexec/rocbudai-detect-topology.sh}"
+
 # 1. Gate on the comment ----------------------------------------------------
 
 job_id="${SLURM_JOB_ID:-}"
@@ -73,6 +78,17 @@ job_comment="${job_comment:-${SLURM_JOB_COMMENT:-}}"
 
 if [[ "$job_comment" != *ollama* ]]; then
     exit 0
+fi
+
+# 1b. Fence the GPUs from THIS node's live topology BEFORE starting ollama, so
+# the daemon binds to the right dies for whatever GPU arch/count this node has
+# (rocbudai-bench reads the same helper -> they always agree). Runs after any
+# compute-partition mode change, so the die count is final at this point.
+if [[ -r "$ROCBUDAI_DETECT_TOPOLOGY" ]]; then
+    bash "$ROCBUDAI_DETECT_TOPOLOGY" --write-fence >/dev/null 2>&1 \
+        || log "WARN: GPU fence write failed; ollama will use any existing fence"
+else
+    log "WARN: detect-topology not found ($ROCBUDAI_DETECT_TOPOLOGY); skipping GPU fence refresh"
 fi
 
 # 2. Start ollama + proxy ---------------------------------------------------

@@ -37,7 +37,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 [rocbudai] error: rocbudai must run on a Slurm-allocated compute node
 [rocbudai]        (no SLURM_JOB_ID in this shell — you are on a login node).
 [rocbudai]
-[rocbudai] allocate one first (-p selects the SPX MI300A partition;
+[rocbudai] allocate one first (-p selects the SPX partition;
 [rocbudai] --comment=ollama starts the ollama daemon for you):
 [rocbudai]   salloc -p PPAC_MI300A_SPX --exclusive --comment=ollama --time=01:00:00
 [rocbudai]
