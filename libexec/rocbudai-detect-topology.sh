@@ -40,7 +40,7 @@
 #     4. Identity last resort: if #NUMA nodes == #GPUs (homogeneous APU),
 #        assume ROCr device i <-> NUMA node i.
 #   ROCBUDAI_TOPO_METHOD reports which rung produced the pin
-#   (sysfs | identity | none) so rocbudai-bench / install.sh can warn when
+#   (sysfs | identity | bench-numa | none) so rocbudai-bench / install.sh can warn when
 #   the CPU pin is missing or heuristic.
 #
 #   Device order is the identity ROCr order, valid before any
@@ -234,6 +234,20 @@ if [[ "$GPU_COUNT" -gt "$RESERVE_GCDS" ]]; then
             BENCH_CPUS=""
             LLM_CPUS=""
             TOPO_METHOD="none"
+        fi
+    fi
+
+    # Multi-GCD-per-NUMA fallback (e.g. MI250X): the LLM devices span the bench
+    # GPU's own NUMA node, so no disjoint LLM/bench CPU split exists and ollama
+    # gets no AllowedCPUs. We can still pin the bench GPU to ITS NUMA-local cores,
+    # which is what actually prevents the cross-NUMA first-touch ~20x slowdown on
+    # memory-bound FOMs. bench_node here is the ROCr bench device's NUMA node.
+    if [[ "$TOPO_METHOD" == "none" && -n "$bench_node" ]]; then
+        _bc="$(cpulist_of_numa "$bench_node")"
+        if [[ -n "$_bc" ]]; then
+            BENCH_CPUS="$_bc"
+            LLM_CPUS=""
+            TOPO_METHOD="bench-numa"
         fi
     fi
 fi
