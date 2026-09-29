@@ -152,7 +152,7 @@ sudo apt-get update
 sudo apt-get install -y zstd curl ca-certificates
 # Pinned to a known-good release (see OLLAMA_VERSION in install.sh). This
 # version already includes the MI300A unified-memory fix, so no rebuild.
-curl -fsSL https://ollama.com/install.sh | sudo OLLAMA_VERSION=0.31.1 sh
+curl -fsSL https://ollama.com/install.sh | sudo OLLAMA_VERSION=0.34.4 sh
 ```
 
 **Behind an outbound proxy.** If compute nodes reach the internet only via an
@@ -210,7 +210,7 @@ ollama versions refused to load any model.
 falling back to `mem_info_gtt_total` (the unified pool) when VRAM is
 zero, and that fix is **merged upstream** (`discover/amd.go`).
 rocBudAI pins `ollama` to a release that already contains the fix
-(`OLLAMA_VERSION` in `install.sh`, currently `0.31.1`), so there is **no
+(`OLLAMA_VERSION` in `install.sh`, currently `0.34.4`), so there is **no
 source rebuild and no patch step** — the stock pinned binary loads
 models on MI300A out of the box.
 

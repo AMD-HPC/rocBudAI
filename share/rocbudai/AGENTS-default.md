@@ -285,16 +285,20 @@ honest fallback above is the only acceptable degraded form.
      128 GB HBM3), MI300X is the discrete GPU (304 CDNA3 + 192
      GB HBM3, no integrated CPU). Spec numbers differ; do not
      swap them.
-   - **USM is NOT the default on MI300A.** The hardware has unified
-     CPU+GPU HBM3 with cache coherence, but the **programming
-     model** still requires explicit opt-in: use `hipMallocManaged`
-     (managed memory) or `hipHostMalloc` with
-     `hipHostMallocCoherent`, AND ensure `HSA_XNACK=1` is set in
-     the user's environment (it is set for the ollama daemon but
-     NOT exported by any rocbudai modulefile for user workloads).
-     Plain `malloc()` + raw-pointer + kernel-arg passing crashes
-     with `HSA_STATUS_ERROR_INVALID_ARGUMENT` or silently
-     round-trips through host.
+   - **MI300A uses the APU programming model: one memory, no copies.**
+     Pointers from plain `malloc`/`new` (Fortran `ALLOCATE`) can be
+     passed directly to HIP kernels; OpenMP offload needs
+     `#pragma omp requires unified_shared_memory`. The one
+     prerequisite is `HSA_XNACK=1` in the job environment: XNACK is
+     off by default on these nodes (`rocminfo | grep xnack` shows
+     `xnack-` until it is exported) and no rocbudai modulefile sets
+     it. Without it, a kernel touching a `malloc` pointer dies with a
+     GPU memory access fault. Build for `gfx942` (xnack any, the
+     default) or `gfx942:xnack+`, not `xnack-`. Do not convert
+     working `malloc` code to `hipMallocManaged`/`hipHostMalloc`;
+     managed memory is the discrete-GPU (MI250X/MI300X) mechanism.
+     Existing `hipMalloc` + `hipMemcpy` code still works, but on the
+     APU those copies are redundant (Playbook 14).
    - **Partition modes (SPX/TPX/CPX, NPS1/NPS4) change effective
      per-GPU specs.** If `hipGetDeviceCount` returns 12 or 24 instead
      of 4, or per-GPU memory ≠ 128 GB, the node is in TPX/CPX mode.

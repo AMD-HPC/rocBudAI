@@ -127,7 +127,7 @@ end
 -- determined user could `unset ROCBUDAI_ALLOWED_MODELS` to bypass, but
 -- they would still hit "model not found" since admins control which
 -- models are actually pulled (the admin-only CLI wrapper + nft ACL).
-setenv("ROCBUDAI_ALLOWED_MODELS", "qwen3.5:122b,gpt-oss:120b,nemotron-3-super:120b")
+setenv("ROCBUDAI_ALLOWED_MODELS", "qwen3.5:122b,gpt-oss:120b,nemotron-3-super:120b,laguna-s-2.1:q4_K_M")
 
 -- ROCBUDAI_SPX_PARTITIONS is the comma-separated list of Slurm partitions
 -- where rocbudai-tui will agree to launch. The model (qwen3.5:122b) needs

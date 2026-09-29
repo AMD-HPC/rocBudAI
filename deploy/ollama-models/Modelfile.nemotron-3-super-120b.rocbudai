@@ -1,5 +1,8 @@
 FROM nemotron-3-super:120b
 
+# ollama 0.34.4 leaves the GPUs idle with >1 CPU thread (see install.sh).
+PARAMETER num_thread 1
+
 # rocbudai SYSTEM augmentation — see deploy/ollama-models/README.md
 # for rationale, application flow, and rollback procedure.
 #

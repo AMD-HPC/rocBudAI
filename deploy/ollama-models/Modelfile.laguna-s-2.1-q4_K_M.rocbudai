@@ -1,16 +1,16 @@
-FROM gpt-oss:120b
+FROM laguna-s-2.1:q4_K_M
 
 # ollama 0.34.4 leaves the GPUs idle with >1 CPU thread (see install.sh).
+# Needs ollama >= 0.32.3 (Laguna tool calling); 0.31.1 cannot load it.
 PARAMETER num_thread 1
 
 # rocbudai SYSTEM augmentation — see deploy/ollama-models/README.md
 # for rationale, application flow, and rollback procedure.
 #
-# Stock gpt-oss:120b ships from ollama.com with no SYSTEM layer
-# (verified 2026-05-13: manifest layers = model + template + license
-# + params, no vnd.ollama.image.system). This Modelfile ADDS a
-# SYSTEM layer; it does not override anything. The base TEMPLATE,
-# LICENSE, and PARAMS layers are preserved via FROM-inheritance.
+# Stock laguna-s-2.1:q4_K_M ships from ollama.com with no SYSTEM layer
+# (verified 2026-09-29 with `ollama show --modelfile`). This Modelfile
+# ADDS a SYSTEM layer; the built-in chat/tool template is preserved via
+# FROM-inheritance.
 
 SYSTEM """
 You are operating under rocbudai's hard rules. The following

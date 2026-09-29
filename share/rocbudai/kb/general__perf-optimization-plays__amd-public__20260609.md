@@ -180,8 +180,8 @@ A play applies only if the profile signature matches it; e.g. occupancy/block-si
 **Goal**: exploit unified HBM.
 
 - Grep for `hipMemcpy.*HostToDevice` / `DeviceToHost`
-- Replace with `hipMalloc` to leverage GPU aware MPI or `hipHostMalloc` + `hipHostGetDevicePointer`
-- Set `HSA_XNACK=1` for demand paging
+- Drop the copy and pass the host (`malloc`/`new`) pointer straight to the kernel; keep `hipMalloc` only where it helps (e.g. GPU-aware MPI)
+- Set `HSA_XNACK=1` (off by default) so the GPU can access `malloc` memory; build for `gfx942` or `gfx942:xnack+`
 - Caveat: APIs still cost ~µs each; remove the call entirely if possible
 
 ### Playbook 15: CPU+GPU Concurrent Execution on MI300A

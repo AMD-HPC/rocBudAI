@@ -9,14 +9,23 @@ rules.
 - `Modelfile.gpt-oss-120b.rocbudai` — applied on top of `gpt-oss:120b` (production)
 - `Modelfile.qwen3.5-122b.rocbudai` — applied on top of `qwen3.5:122b` (production)
 - `Modelfile.nemotron-3-super-120b.rocbudai` — applied on top of `nemotron-3-super:120b` (production)
+- `Modelfile.laguna-s-2.1-q4_K_M.rocbudai` — applied on top of `laguna-s-2.1:q4_K_M` (production; needs ollama >= 0.32.3)
 - `Modelfile.gemma4-12b.rocbudai` — applied on top of `gemma4:12b` (**`--container` quick-test only**)
 
-All files use Ollama's `FROM <stock-model>` + `SYSTEM """..."""`
-two-directive shape. The base `TEMPLATE`, `LICENSE`, and `PARAMS`
-layers are inherited unchanged via `FROM`; the only thing the overlay
-adds is a `vnd.ollama.image.system` layer with the rocbudai rules.
+All files use Ollama's `FROM <stock-model>` + `PARAMETER num_thread 1` +
+`SYSTEM """..."""` shape. The base `TEMPLATE`, `LICENSE`, and `PARAMS`
+layers are inherited via `FROM` (the `num_thread` parameter merges into the
+stock params); the overlay adds a `vnd.ollama.image.system` layer with the
+rocbudai rules.
 
-The three production overlays carry a **short** hard-rules summary and
+**Keep `PARAMETER num_thread 1` in every overlay.** With its default CPU
+thread count, ollama 0.34.4 leaves the GPUs idle and adds a fixed ~250 ms per
+token (three production models, default 128 threads vs `num_thread 1`:
+3.6-3.8 -> 47-67 tok/s on MI250X, 17-21 -> 87-136 tok/s on MI300A). With 1
+thread the model still runs fully on the GPUs, and prefill is also faster
+than with the default.
+
+The four production overlays carry a **short** hard-rules summary and
 defer to `AGENTS.md` for the full persona. The `gemma4-12b` overlay is
 different: it is the **self-contained demo persona** (welcome + 7-question
 flow + profiling loop), because the `--container` quick-test cannot rely on
@@ -30,7 +39,7 @@ Three moments:
 1. **Fresh install** — `install.sh` step 3 (after `ollama pull`)
    automatically runs `ollama create <model> -f Modelfile.<model>.rocbudai`
    for every supported model name (`gpt-oss:120b`, `qwen3.5:122b`,
-   `nemotron-3-super:120b`). Custom `MODEL_NAME` values that don't
+   `nemotron-3-super:120b`, `laguna-s-2.1:q4_K_M`). Custom `MODEL_NAME` values that don't
    have a matching Modelfile are skipped with a warning. The `--container`
    quick-test runs the same step inside the container with
    `MODEL_NAME=gemma4:12b`, so the `gemma4-12b` overlay is applied there too.

@@ -33,7 +33,10 @@ OPENCODE_VERSION="1.14.28"
 # the OLLAMA_VERSION env var). Pinned for reproducibility, same as
 # OPENCODE_VERSION. This release already contains the MI300A unified-memory fix
 # (issue #8735 / PR #13463, merged upstream), so no source rebuild is needed.
-OLLAMA_VERSION="0.31.1"
+# With its default CPU thread count this release leaves the GPUs idle (~250 ms
+# per token), so every overlay in deploy/ollama-models/ must keep
+# `PARAMETER num_thread 1`.
+OLLAMA_VERSION="0.34.4"
 # Outbound HTTP(S) proxy for install-time fetches. Empty = direct egress (the
 # default). When set it is applied to: the ollama vendor installer, the opencode
 # download, AND a systemd drop-in so the DAEMON uses it — step 3's `ollama pull`
