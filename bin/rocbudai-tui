@@ -1142,6 +1142,19 @@ if [[ -n "$ROCBUDAI_OPENCODE_PORT" && "${ROCBUDAI_NUDGE_DISABLE:-0}" != "1" \
     disown "$ROCBUDAI_WATCHER_PID" 2>/dev/null || true
 fi
 
+# Fence the agent's shell onto the bench GPU: an HSA_XNACK=1 app sharing a GPU
+# with the XNACK-off model server stalls. Opt out: ROCBUDAI_NO_FENCING=1.
+if [[ -z "${ROCBUDAI_CONTAINER:-}" && "${ROCBUDAI_NO_FENCING:-0}" != "1" ]]; then
+    if [[ -z "${ROCBUDAI_BENCH_GPU:-}" && -r "${ROCBUDAI_ROOT}/libexec/rocbudai-detect-topology.sh" ]]; then
+        eval "$(bash "${ROCBUDAI_ROOT}/libexec/rocbudai-detect-topology.sh" 2>/dev/null \
+                | grep -E '^ROCBUDAI_BENCH_(GPU|CPUS)=[0-9,-]*$')"
+    fi
+    if [[ -n "${ROCBUDAI_BENCH_GPU:-}" ]]; then
+        export ROCR_VISIBLE_DEVICES="$ROCBUDAI_BENCH_GPU" ROCBUDAI_BENCH_GPU ROCBUDAI_BENCH_CPUS
+        info "agent GPU fence: ROCR_VISIBLE_DEVICES=${ROCBUDAI_BENCH_GPU} (bench GPU; the model keeps the others)"
+    fi
+fi
+
 ollama launch opencode --model "${ROCBUDAI_MODEL}" -y -- "${OPENCODE_EXTRA_ARGS[@]}" || true
 
 # Watcher is parent-death-guarded but stop it eagerly on clean exit too,

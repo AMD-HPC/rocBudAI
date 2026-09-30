@@ -2129,15 +2129,9 @@ ROCPROFSYS_TIMEMORY_COMPONENTS="wall_clock network_stats" \
    to step 3.)
 
    ```bash
-   export ROCR_VISIBLE_DEVICES=0          # set BEFORE the profiler
    rocprof-compute profile -n ml_run -- python script.py <args>
    rocprof-compute analyze -p workloads/ml_run/MI350_A1
    ```
-
-   Common gotcha (Phase-3 Q-PT-4): `ROCR_VISIBLE_DEVICES=…` placed
-   *between* the profiler and `--` is interpreted as a file path by
-   `rocprofv3` (which the profiler wraps internally). Set it as
-   `export` first.
 
 3. **Then — `rocprofv3 --kernel-trace` + the framework profiler** —
    for kernel-launch-overhead vs kernel-compute-time questions.
@@ -2149,7 +2143,6 @@ ROCPROFSYS_TIMEMORY_COMPONENTS="wall_clock network_stats" \
    kernel-launch timeline shows the degradation).
 
    ```bash
-   export ROCR_VISIBLE_DEVICES=0
    rocprofv3 --kernel-trace --stats -- python script.py <args>
    ```
 
