@@ -927,6 +927,48 @@ fi
 _ROCBUDAI_BANNER_PERM_SHORT="${_ROCBUDAI_BANNER_PERM_SHORT%$'\n'}"
 _ROCBUDAI_BANNER_PERM_FULL="${_ROCBUDAI_BANNER_PERM_FULL%$'\n'}"
 
+# In the container quick-test the demo is fully user-paced: the user reads
+# the welcome, then types/accepts each suggested demo answer. The idle-timeout
+# auto-nudge does more harm than good there — a slow first response on a
+# freshly-loaded model trips the 120 s timer and injects "continue", which
+# derails a small demo model mid-interview (one of the reported failure
+# modes). Default the nudge OFF in the container (still overridable via
+# ROCBUDAI_NUDGE_DISABLE). Must run before the banner so it reports the
+# nudge state the watcher launch below actually uses.
+if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
+    ROCBUDAI_NUDGE_DISABLE="${ROCBUDAI_NUDGE_DISABLE:-1}"
+fi
+
+if [[ "${ROCBUDAI_NUDGE_DISABLE:-0}" == "1" ]]; then
+    IFS= read -r -d '' _ROCBUDAI_BANNER_NUDGE_SHORT <<'NUDGE_EOF' || true
+Auto-nudge is OFF: when a turn ends I wait for your next message.
+NUDGE_EOF
+    IFS= read -r -d '' _ROCBUDAI_BANNER_NUDGE_FULL <<'NUDGE_EOF' || true
+Auto-nudge is OFF (ROCBUDAI_NUDGE_DISABLE=1): when a turn ends I wait for
+your next message instead of injecting a "continue" myself. To turn it
+back on, type /exit, then run:
+
+    unset ROCBUDAI_NUDGE_DISABLE
+    module load rocbudai
+NUDGE_EOF
+else
+    IFS= read -r -d '' _ROCBUDAI_BANNER_NUDGE_SHORT <<NUDGE_EOF || true
+Auto-nudge: if a turn ends and we sit idle for ${ROCBUDAI_NUDGE_AFTER_S:-240} s, I'll inject a
+"continue" myself so we don't both wait. It shows up in the transcript.
+NUDGE_EOF
+    IFS= read -r -d '' _ROCBUDAI_BANNER_NUDGE_FULL <<NUDGE_EOF || true
+Auto-nudge: if a turn ends and the session stays idle for ${ROCBUDAI_NUDGE_AFTER_S:-240} s, I'll
+inject a "continue" myself so we don't both sit there waiting. The
+nudge is a normal user message and will show up in the transcript.
+To tighten / loosen / disable, before \`module load rocbudai\`:
+
+    export ROCBUDAI_NUDGE_AFTER_S=60     # tighter loop (default 240 s)
+    export ROCBUDAI_NUDGE_DISABLE=1      # turn off entirely
+NUDGE_EOF
+fi
+_ROCBUDAI_BANNER_NUDGE_SHORT="${_ROCBUDAI_BANNER_NUDGE_SHORT%$'\n'}"
+_ROCBUDAI_BANNER_NUDGE_FULL="${_ROCBUDAI_BANNER_NUDGE_FULL%$'\n'}"
+
 if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
     # Container quick-test banner. No Slurm/partition/module concepts apply
     # here, so the cluster banner's --comment / `module load rocbudai`
@@ -951,8 +993,7 @@ the HIP saxpy example so you can watch the whole flow on a tiny kernel.
 
 ${_ROCBUDAI_BANNER_PERM_SHORT}
 
-Auto-nudge: if a turn ends and we sit idle for 240 s, I'll inject a
-"continue" myself so we don't both wait. It shows up in the transcript.
+${_ROCBUDAI_BANNER_NUDGE_SHORT}
 
 To exit: type /exit or Ctrl-D.
 
@@ -980,13 +1021,7 @@ this job runs. Verify: rocbudai-airgap-check
 
 ${_ROCBUDAI_BANNER_PERM_FULL}
 
-Auto-nudge: if a turn ends and the session stays idle for 240 s, I'll
-inject a "continue" myself so we don't both sit there waiting. The
-nudge is a normal user message and will show up in the transcript.
-To tighten / loosen / disable, before \`module load rocbudai\`:
-
-    export ROCBUDAI_NUDGE_AFTER_S=60     # tighter loop (default 240 s)
-    export ROCBUDAI_NUDGE_DISABLE=1      # turn off entirely
+${_ROCBUDAI_BANNER_NUDGE_FULL}
 
 To exit: type /exit or Ctrl-D.
 To resume this session later: cd ${_ROCBUDAI_CWD_FULL} && rocbudai --continue
@@ -1112,17 +1147,6 @@ else
     info "cold start: the first response can take ~1 min while the model warms up."
 fi
 echo
-
-# In the container quick-test the demo is fully user-paced: the user reads
-# the welcome, then types/accepts each suggested demo answer. The idle-timeout
-# auto-nudge does more harm than good there — a slow first response on a
-# freshly-loaded model trips the 120 s timer and injects "continue", which
-# derails a small demo model mid-interview (one of the reported failure
-# modes). Default the nudge OFF in the container (still overridable via
-# ROCBUDAI_NUDGE_DISABLE).
-if [[ -n "${ROCBUDAI_CONTAINER:-}" ]]; then
-    ROCBUDAI_NUDGE_DISABLE="${ROCBUDAI_NUDGE_DISABLE:-1}"
-fi
 
 # Auto-nudge watcher (out-of-process sidecar — see libexec/rocbudai-nudge-watcher
 # for the full design + heuristic). We pick a free ephemeral port via the
