@@ -3,6 +3,16 @@
   "model": "ollama/qwen3.5:122b",
   "share": "disabled",
   "instructions": ["AGENTS.md"],
+  "provider": {
+    "ollama": {
+      "models": {
+        "qwen3.5:122b": { "limit": { "context": 262144, "output": 32768 } },
+        "gpt-oss:120b": { "limit": { "context": 131072, "output": 32768 } },
+        "nemotron-3-super:120b": { "limit": { "context": 262144, "output": 32768 } },
+        "laguna-s-2.1:q4_K_M": { "limit": { "context": 262144, "output": 32768 } }
+      }
+    }
+  },
   "permission": {
     "edit": "ask",
     "webfetch": "ask",
