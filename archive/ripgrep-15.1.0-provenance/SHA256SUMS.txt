@@ -1,0 +1,1 @@
+1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599  ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz

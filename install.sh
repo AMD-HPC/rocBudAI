@@ -1127,6 +1127,46 @@ step_5_stage_install_tree() {
     run_root find "${INSTALL_ROOT}/bin" "${INSTALL_ROOT}/libexec" -type f -exec chmod 0755 {} +
 }
 
+# opencode's glob/grep tools look for `rg` on PATH and otherwise download it
+# from GitHub, which fails on compute nodes without egress. ${INSTALL_ROOT}/bin
+# is on PATH via the modulefile and the container shim.
+step_5_stage_ripgrep() {
+    local rg_version="15.1.0"
+    local rg_dir="ripgrep-${rg_version}-x86_64-unknown-linux-musl"
+    section "Step 5/7 — Stage ripgrep v${rg_version}"
+
+    local dest_bin="${INSTALL_ROOT}/bin/rg"
+    if [[ -x "${dest_bin}" ]]; then
+        info "${dest_bin} already exists; skipping download. (Remove the file by hand to force a re-stage.)"
+        return 0
+    fi
+
+    local stage
+    stage="$(mktemp -d -t ripgrep-stage.XXXXXX)"
+    info "Staging dir: ${stage}"
+
+    local url="https://github.com/BurntSushi/ripgrep/releases/download/${rg_version}/${rg_dir}.tar.gz"
+    local _cx=()
+    [[ -n "${SITE_HTTP_PROXY}" ]] && _cx=(--proxy "${SITE_HTTP_PROXY}")
+    run curl -fL ${_cx[@]+"${_cx[@]}"} --output "${stage}/${rg_dir}.tar.gz" "${url}"
+
+    local sums_file="${REPO_ROOT}/archive/ripgrep-${rg_version}-provenance/SHA256SUMS.txt"
+    info "Verifying ${rg_dir}.tar.gz against ${sums_file}"
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        ( cd "${stage}" && sha256sum -c "${sums_file}" ) \
+            || die "sha256 mismatch: ${rg_dir}.tar.gz differs from the in-repo provenance manifest. Refusing to install."
+    fi
+
+    run tar -C "${stage}" -xzf "${stage}/${rg_dir}.tar.gz"
+    run_root cp "${stage}/${rg_dir}/rg" "${dest_bin}"
+    run_root chown root:root "${dest_bin}"
+    run_root chmod 0755 "${dest_bin}"
+
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        rm -rf "${stage}"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Step 6 — Drop the modulefile on the site MODULEPATH
 # ---------------------------------------------------------------------------
@@ -1855,6 +1895,7 @@ main() {
     step_3_pull_model
     step_4_stage_opencode
     step_5_stage_install_tree
+    step_5_stage_ripgrep
     step_6_drop_modulefile
     step_7_verify
 

@@ -424,6 +424,18 @@ sudo cp -a /path/to/rocbudai/install/. /shared/apps/ubuntu/opt/rocbudai/
 sudo chown -R root:root /shared/apps/ubuntu/opt/rocbudai
 ```
 
+Stage `rg` into `bin/`: opencode's glob/grep tools otherwise try to
+download ripgrep from GitHub, which fails on compute nodes without egress.
+
+```bash
+RG_VER=15.1.0
+cd /tmp/opencode-stage
+curl -LO https://github.com/BurntSushi/ripgrep/releases/download/${RG_VER}/ripgrep-${RG_VER}-x86_64-unknown-linux-musl.tar.gz
+sha256sum -c "${ROCBUDAI_REPO}/archive/ripgrep-${RG_VER}-provenance/SHA256SUMS.txt"
+tar xzf ripgrep-${RG_VER}-x86_64-unknown-linux-musl.tar.gz
+sudo install -o root -g root -m 0755 ripgrep-${RG_VER}-x86_64-unknown-linux-musl/rg /shared/apps/ubuntu/opt/rocbudai/bin/rg
+```
+
 The install tree's layout (the README is kept in the source repo, not
 in the deployed install tree — see the project's GitHub for the
 authoritative copy; everything below is what `find` actually sees on
@@ -444,7 +456,8 @@ disk after this step):
 │   │                            airgap baseline is in force on the compute node
 │   ├── rocbudai-doctor          standalone preflight diagnostic (11 checks)
 │   ├── rocbudai-reap-stale      finds / kills leaked KFD-bound profile children
-│   └── rocbudai-ingest-inputs   admin tool: PDF → MD knowledge-base sidecars
+│   ├── rocbudai-ingest-inputs   admin tool: PDF → MD knowledge-base sidecars
+│   └── rg                       ripgrep, staged from upstream (see above)
 ├── libexec/
 │   └── rocbudai-load-hook.sh    logic the modulefile execs on `module load`
 ├── share/rocbudai/
