@@ -102,6 +102,8 @@ setenv("OPENCODE_DISABLE_MODELS_FETCH",    "1")
 setenv("OPENCODE_DISABLE_EXTERNAL_SKILLS", "1")
 setenv("OPENCODE_DISABLE_SHARE",           "1")
 
+setenv("OPENCODE_DISABLE_MOUSE", "1")
+
 -- Set ROCBUDAI_MODEL only if the user hasn't already exported a value.
 -- The canonical default is qwen3.5:122b (promoted from opt-in to default
 -- 2026-06-08, replacing gpt-oss:120b). gpt-oss:120b — the previous

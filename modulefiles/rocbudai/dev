@@ -89,6 +89,8 @@ rb_setenv OPENCODE_DISABLE_MODELS_FETCH 1
 rb_setenv OPENCODE_DISABLE_EXTERNAL_SKILLS 1
 rb_setenv OPENCODE_DISABLE_SHARE 1
 
+rb_setenv OPENCODE_DISABLE_MOUSE 1
+
 # Default model — only set if the user hasn't already exported one.
 if {![info exists env(ROCBUDAI_MODEL)] || $env(ROCBUDAI_MODEL) eq ""} {
     rb_setenv ROCBUDAI_MODEL qwen3.5:122b
