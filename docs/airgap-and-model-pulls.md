@@ -208,6 +208,8 @@ ssh "$NODE" 'sudo systemctl stop ollama-egress.service'
 #    NOTE: with the local NVMe model cache in place, the pull
 #    lands in /var/local/cache/ollama on $NODE — NOT in
 #    /shareddata/Ollama_Models. We push it back in step 4.5.
+#    EXCEPTION: nemotron-3-super:120b is imported from a GGUF with
+#    `ollama-real create`, not pulled (deploy/ollama-models/README.md).
 ssh "$NODE" 'sudo -u ollama OLLAMA_HOST=127.0.0.1:11435 \
             ollama-real pull MODEL_NAME_HERE'
 ssh "$NODE" 'sudo -u ollama OLLAMA_HOST=127.0.0.1:11435 \
@@ -220,8 +222,9 @@ ssh "$NODE" 'sudo nft list table inet ollama_egress'  # sanity check
 # 4.5. Push the new blobs/manifests from the pull node's local cache
 #      back to the NFS-shared model store, so other nodes can re-sync.
 #      Use --update so existing files (older models) are not clobbered
-#      by the local copy.
-ssh "$NODE" 'sudo rsync -a --update \
+#      by the local copy. -rlpt, not -a: the ollama UID/GID differ between
+#      compute nodes and the NFS store, so -a would re-own store files.
+ssh "$NODE" 'sudo rsync -rlpt --update \
              /var/local/cache/ollama/ /shareddata/Ollama_Models/'
 
 # 4.6. Trigger a re-sync on the other SPX nodes (or wait for next boot).
@@ -268,7 +271,7 @@ if [[ -f "$OVERLAY" ]]; then
                  ollama-real create $MODEL_NAME -f $OVERLAY"
     # 8b. The augmented manifest is now in /var/local/cache/ollama on $NODE.
     #     Re-rsync to NFS so other nodes pick up the SYSTEM-augmented version.
-    ssh "$NODE" 'sudo rsync -a --update \
+    ssh "$NODE" 'sudo rsync -rlpt --update \
                  /var/local/cache/ollama/ /shareddata/Ollama_Models/'
     # 8c. Trigger re-sync on the other SPX nodes (same as step 4.6).
     for n in $(sinfo -h -p PPAC_MI300A_SPX -N -o '%N' | \

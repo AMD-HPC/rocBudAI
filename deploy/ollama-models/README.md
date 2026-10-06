@@ -8,7 +8,7 @@ rules.
 
 - `Modelfile.gpt-oss-120b.rocbudai` — applied on top of `gpt-oss:120b` (production)
 - `Modelfile.qwen3.5-122b.rocbudai` — applied on top of `qwen3.5:122b` (production)
-- `Modelfile.nemotron-3-super-120b.rocbudai` — applied on top of `nemotron-3-super:120b` (production)
+- `Modelfile.nemotron-3-super-120b.rocbudai` — applied on top of `nemotron-3-super:120b` (production; base imported from GGUF, see below)
 - `Modelfile.laguna-s-2.1-q4_K_M.rocbudai` — applied on top of `laguna-s-2.1:q4_K_M` (production; needs ollama >= 0.32.3)
 - `Modelfile.gemma4-12b.rocbudai` — applied on top of `gemma4:12b` (**`--container` quick-test only**)
 
@@ -54,6 +54,39 @@ Three moments:
    rocbudai rule lands and we want it at the SYSTEM-prompt level),
    re-run `ollama create` on every node via your site's
    parallel-ssh / pdsh loop (admin-only).
+
+## `nemotron-3-super:120b` base (imported, not pulled)
+
+Do **not** `ollama pull nemotron-3-super:120b`. The ollama.com blob
+(`sha256:0fc53cc990a2…`, 87 GB Q4_K_M) is in ollama's legacy tensor layout,
+which ollama 0.34.4 translates at load time (`llama/compat`). Under
+ollama 0.32.3-0.35.1 it corrupts ~25-55% of tool-call paths (e.g.
+`profiling_ with_ai/`, `0gcapodag`, `shallow_水`); no sampling setting fixes
+it. The upstream-layout unsloth GGUF on the same ollama 0.34.4 gave 0/22
+corrupt paths on the same replayed request (library blob: 21/89).
+
+Import it on the pull node (as in `docs/airgap-and-model-pulls.md`, but
+`create` instead of `pull`; no egress needed), then apply the overlay:
+
+```bash
+# <gguf-dir>: readable by the ollama user, holding the three shards of
+# https://huggingface.co/unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF/tree/main/UD-Q4_K_M
+cat > <gguf-dir>/Modelfile <<'EOF'
+FROM <gguf-dir>
+RENDERER nemotron-3-nano
+PARSER nemotron-3-nano
+PARAMETER temperature 1
+PARAMETER top_p 0.95
+EOF
+# Optional: append LICENSE """<NVIDIA license text>""" to keep the license layer.
+sudo -u ollama OLLAMA_HOST=127.0.0.1:11435 ollama-real create nemotron-3-super:120b -f <gguf-dir>/Modelfile
+sudo -u ollama OLLAMA_HOST=127.0.0.1:11435 ollama-real create nemotron-3-super:120b \
+    -f deploy/ollama-models/Modelfile.nemotron-3-super-120b.rocbudai
+```
+
+Then push to NFS and re-sync the other nodes (steps 4.5 and 4.6 of
+`docs/airgap-and-model-pulls.md`). `RENDERER`/`PARSER`/`PARAMETER` match the
+ollama.com manifest, so prompts and tool-call parsing are unchanged.
 
 ## Why a SYSTEM-level overlay (vs. AGENTS.md alone)
 

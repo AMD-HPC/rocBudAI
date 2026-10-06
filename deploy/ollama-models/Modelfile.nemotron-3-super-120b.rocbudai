@@ -6,12 +6,11 @@ PARAMETER num_thread 1
 # rocbudai SYSTEM augmentation — see deploy/ollama-models/README.md
 # for rationale, application flow, and rollback procedure.
 #
-# Stock nemotron-3-super:120b ships from ollama.com — the manifest
-# layers are verified at apply-time via `ollama show --modelfile` on
-# the pull node, in the same shape as the prior two models. This
-# Modelfile ADDS a SYSTEM layer; it does not override anything. The base chat
-# template (built into the model weights for Nemotron 3 Super),
-# LICENSE, and PARAMS layers are preserved via FROM-inheritance.
+# The nemotron-3-super:120b base is NOT pulled from ollama.com; it is
+# imported from an upstream-layout GGUF (README.md, "nemotron-3-super:120b
+# base"). This Modelfile ADDS a SYSTEM layer; it does not override anything.
+# The base RENDERER/PARSER, LICENSE, and PARAMS layers are preserved via
+# FROM-inheritance.
 
 SYSTEM """
 You are operating under rocbudai's hard rules. The following

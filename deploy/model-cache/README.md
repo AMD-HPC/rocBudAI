@@ -119,7 +119,8 @@ the NFS store. To make it visible cluster-wide you must push the new
 blobs back to NFS and re-sync the other nodes:
 
 ```bash
-sudo rsync -a --update /var/local/cache/ollama/ /shareddata/Ollama_Models/
+# -rlpt, not -a: the ollama UID/GID differ between compute nodes and the store.
+sudo rsync -rlpt --update /var/local/cache/ollama/ /shareddata/Ollama_Models/
 for n in <other-spx-nodes>; do
     sudo ssh "$n" 'sudo systemctl restart rocbudai-model-cache.service'
 done

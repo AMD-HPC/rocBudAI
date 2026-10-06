@@ -6,9 +6,9 @@
   "provider": {
     "ollama": {
       "models": {
-        "qwen3.5:122b": { "limit": { "context": 262144, "output": 32768 } },
+        "qwen3.5:122b": { "limit": { "context": 262144, "output": 32768 }, "options": { "temperature": 0.6, "top_p": 0.95 } },
         "gpt-oss:120b": { "limit": { "context": 131072, "output": 32768 } },
-        "nemotron-3-super:120b": { "limit": { "context": 262144, "output": 32768 } },
+        "nemotron-3-super:120b": { "limit": { "context": 262144, "output": 32768 }, "options": { "top_p": 0.95 } },
         "laguna-s-2.1:q4_K_M": { "limit": { "context": 262144, "output": 32768 } }
       }
     }

@@ -4,6 +4,9 @@ FROM laguna-s-2.1:q4_K_M
 # Needs ollama >= 0.32.3 (Laguna tool calling); 0.31.1 cannot load it.
 PARAMETER num_thread 1
 
+# Vendor generation_config top_k; opencode's /v1 requests cannot carry top_k.
+PARAMETER top_k 20
+
 # rocbudai SYSTEM augmentation — see deploy/ollama-models/README.md
 # for rationale, application flow, and rollback procedure.
 #
