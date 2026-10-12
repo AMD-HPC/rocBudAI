@@ -24,6 +24,9 @@ set -euo pipefail
 ROCBUDAI_ROOT="${ROCBUDAI_ROOT:-/shared/apps/ubuntu/opt/rocbudai}"
 ROCBUDAI_OPENCODE_DIR="${ROCBUDAI_OPENCODE_DIR:-/shared/apps/ubuntu/opt/opencode/1.14.28}"
 ROCBUDAI_OPENCODE_BIN="${ROCBUDAI_OPENCODE_BIN:-${ROCBUDAI_OPENCODE_DIR}/opencode}"
+# Dir only exists to PATH-prepend the bin's dir; keep them aligned so a site that
+# overrides only *_BIN still puts the pinned opencode on PATH for `ollama launch`.
+ROCBUDAI_OPENCODE_DIR="$(dirname "$ROCBUDAI_OPENCODE_BIN")"
 ROCBUDAI_OLLAMA_HOST="${ROCBUDAI_OLLAMA_HOST:-http://127.0.0.1:11434}"
 ROCBUDAI_MODEL="${ROCBUDAI_MODEL:-qwen3.5:122b}"
 ROCBUDAI_ALLOWED_MODELS="${ROCBUDAI_ALLOWED_MODELS:-qwen3.5:122b}"
