@@ -479,9 +479,9 @@ honest fallback above is the only acceptable degraded form.
     `./report.md` and prints `schema PASS` or
     `K schema issue(s)` with the specific issue list. The
     validator catches structural failures the manual scan misses
-    (missing unit suffix on `[FACT]` lines, non-monotonic
-    iteration headers, orphan `## Files modified this session`
-    placement). Treat any "schema issue(s)" line as a same-turn
+    (missing unit suffix on `[FACT]` lines, empty iteration bodies,
+    orphan tail content, an empty `## Files modified this session`
+    table). Treat any "schema issue(s)" line as a same-turn
     repair task; do NOT announce "report updated" / "appended" /
     "wrote" until doctor returns `schema PASS`. The doctor is
     read-only on `report.md`, so running it costs one tool call
@@ -1844,7 +1844,7 @@ revert. See §1 rule 10 for the full contract.)
 
 ---
 
-# <app name> — rocBudAI iteration NN
+## Iteration NN — <app name>
 
 **Command profiled.** `./<binary> <args>`
 **ROCm version.** `rocm/<ver>`

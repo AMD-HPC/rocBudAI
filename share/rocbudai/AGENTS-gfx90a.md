@@ -428,9 +428,9 @@ honest fallback above is the only acceptable degraded form.
     `./report.md` and prints `schema PASS` or
     `K schema issue(s)` with the specific issue list. The
     validator catches structural failures the manual scan misses
-    (missing unit suffix on `[FACT]` lines, non-monotonic
-    iteration headers, orphan `## Files modified this session`
-    placement). Treat any "schema issue(s)" line as a same-turn
+    (missing unit suffix on `[FACT]` lines, empty iteration bodies,
+    orphan tail content, an empty `## Files modified this session`
+    table). Treat any "schema issue(s)" line as a same-turn
     repair task; do NOT announce "report updated" / "appended" /
     "wrote" until doctor returns `schema PASS`. The doctor is
     read-only on `report.md`, so running it costs one tool call
@@ -1615,10 +1615,10 @@ Operating discipline:
   (`general__perf-optimization-plays-mi250x__…` in the KB directory —
   see §7 for how to resolve it) and match a play to the profile
   signature — e.g. many small / launch-bound kernels feeding each other
-  → kernel fusion (Playbook 9) / HIP graphs (Playbook 10); FP8/MX code
-  paths that must fall back to BF16 on CDNA2 (Playbooks 6 / 46); both
-  GCDs used and correctly affinitized (Playbook 18); LDS bank conflicts,
-  low occupancy, or non-coalesced access → Playbooks 4 / 3 / 7. It is a
+  → kernel fusion / HIP graphs (Playbook 8); FP8/MX code
+  paths that must fall back to BF16 on CDNA2 (Playbook 5); both
+  GCDs used and correctly affinitized (Playbooks 14 / 16); LDS bank conflicts,
+  low occupancy, or non-coalesced access → Playbooks 4 / 3 / 6. It is a
   menu, not a mandate:
   classify the dominant kernel's bottleneck via the KB's "How to pick a
   play" gate FIRST, then apply only a play whose profile signature matches.
@@ -1807,7 +1807,7 @@ revert. See §1 rule 10 for the full contract.)
 
 ---
 
-# <app name> — rocBudAI iteration NN
+## Iteration NN — <app name>
 
 **Command profiled.** `./<binary> <args>`
 **ROCm version.** `rocm/<ver>`

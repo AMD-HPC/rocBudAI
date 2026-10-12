@@ -114,7 +114,7 @@ honest fallback above is the only acceptable degraded form.
 (There is no longer any user-visible JSON file to copy or edit.
 `rocbudai-tui` reads `$ROCBUDAI_AUTORUN` and writes the right
 `opencode.json` from a template under
-`/shared/apps/ubuntu/opt/rocbudai/share/rocbudai/` automatically.)
+`${ROCBUDAI_ROOT}/share/rocbudai/` automatically.)
 
 ---
 
@@ -133,8 +133,10 @@ honest fallback above is the only acceptable degraded form.
 >   (single-rank + single-GPU) or `rocbudai-submit --gpus N` (multi-rank OR
 >   multi-GPU); a bare `time`/`mpirun`, or the wrong one of the two, is a
 >   violation. Any cited number outside a multi-rep table must be the
->   median of ≥3 reps, or be tagged "preliminary, n=1" verbatim. (Body in
->   Rule 17 + §5.0.)
+>   median of ≥3 reps, or be tagged "preliminary, n=1" verbatim. If the
+>   user's Q7 FOM is **kernel time**, the FOM is instead the median of ≥3
+>   `rocprofv3` kernel-sums; `rocbudai-bench` wall time is then a
+>   secondary signal, never the headline. (Body in Rule 17 + §5.0.)
 > - **Rule 10 — no raw `Edit` on `report.md`.** Use the
 >   Read-before-Edit + Read-after-Edit + `rocbudai-doctor`
 >   schema-check loop. (Body in Rule 10.)
@@ -145,7 +147,7 @@ honest fallback above is the only acceptable degraded form.
 >   any tool) modified it earlier this session.** (Body in
 >   Rule 24, with the consolidated procedure in Rule 10c.)
 >
-> The other 19 rules are best-practices: violations cost user time
+> The other 22 rules are best-practices: violations cost user time
 > (rejected tool calls, churned edits, confused diagnosis) but are
 > not turn-invalidating. They are also less reliably enforced —
 > the SYSTEM overlay does not carry them. Read them, follow them,
@@ -187,7 +189,7 @@ honest fallback above is the only acceptable degraded form.
    tree into your cwd unless they explicitly ask you to: it desyncs
    from their git workflow and produces stale duplicates. Profile
    dirs (`prof_v3/`, `prof_compute/`) and `report.md` go *next to the
-   code* you are profiling — that is the natural artefact location.
+   code* you are profiling, i.e. your cwd (`./report.md`, Rule 10a).
    Never write to `~`, `/etc`, `/usr`, `/opt`, `/home/admin`,
    `/shareddata/Ollama_Models`, or any path you do not own.
 
@@ -425,9 +427,9 @@ honest fallback above is the only acceptable degraded form.
     `./report.md` and prints `schema PASS` or
     `K schema issue(s)` with the specific issue list. The
     validator catches structural failures the manual scan misses
-    (missing unit suffix on `[FACT]` lines, non-monotonic
-    iteration headers, orphan `## Files modified this session`
-    placement). Treat any "schema issue(s)" line as a same-turn
+    (missing unit suffix on `[FACT]` lines, empty iteration bodies,
+    orphan tail content, an empty `## Files modified this session`
+    table). Treat any "schema issue(s)" line as a same-turn
     repair task; do NOT announce "report updated" / "appended" /
     "wrote" until doctor returns `schema PASS`. The doctor is
     read-only on `report.md`, so running it costs one tool call
@@ -820,7 +822,7 @@ honest fallback above is the only acceptable degraded form.
        project-specific tolerance from `man rocbudai`, the project
        README, or the user's Q7/7 answer overrides this default).
     5. **Only after correctness passes**, run the full FOM
-       measurement per §5.0 (multi-rep, un-instrumented) and report
+       measurement per §5.0 / Rule 17 (multi-rep) and report
        the performance numbers.
 
     If correctness fails (residue diverges, output is `nan`, the
@@ -868,6 +870,12 @@ honest fallback above is the only acceptable degraded form.
     test 2026-05-12); single-rep wall-time interpretation is the
     dominant source of fabricated `[FACT]` speed-up claims in
     production rocBudAI sessions.
+
+    **Kernel-time FOM.** If Q7 is kernel time, the FOM is the median
+    over ≥3 profiled reps (own `-d` dir each; keep the baseline's) of
+    the `TotalDurationNs` sum in `rocprofv3 --kernel-trace --stats`
+    `*_kernel_stats.csv`. `rocbudai-bench` wall time is secondary:
+    never the headline or the verdict.
 
     **Full procedure** — noise-floor numbers (~30-35 % intra-rep
     variance under `salloc --exclusive`), the 3-rep shell loop,
@@ -1481,7 +1489,7 @@ make: *** /opt/rocm/bin/hipcc: No such file or directory.  Stop.
 
 The Makefile defaulted to `/opt/rocm/bin/hipcc` (the system path,
 which is **not** installed on this cluster — ROCm here lives under
-`/shared/apps/ubuntu/opt/rocm-<ver>/`, exposed via Lmod modules
+the module's `$ROCM_PATH`, exposed via Lmod modules
 only). The agent then spent ~3 minutes and 4 wasted ASK approvals
 running `module avail`, `module show rocbudai`, and `module show
 rocm` to diagnose, before realising the fix is a single chained
@@ -1593,7 +1601,7 @@ This is the core of rocBudAI. The loop is:
 
 ```
    build → run → profile → analyse → propose ONE change →
-   user approves edit → rebuild → run → profile → compare
+   edit (opencode gate, Rule 1) → rebuild → run → profile → compare
 ```
 
 Operating discipline:
@@ -1612,10 +1620,10 @@ Operating discipline:
   (`general__perf-optimization-plays-mi300a__…` in the KB directory —
   see §7 for how to resolve it) and match a play to the profile
   signature — e.g. many small / launch-bound kernels feeding each other
-  → kernel fusion (Playbook 9) / HIP graphs (Playbook 10) /
-  `torch.compile` (Playbook 32); redundant `hipMemcpy` H2D/D2H on this
-  APU → unified memory (Playbook 16); LDS bank conflicts, low occupancy,
-  or non-coalesced access → Playbooks 4 / 3 / 7. It is a menu, not a mandate:
+  → kernel fusion / HIP graphs (Playbook 8) /
+  `torch.compile` (Playbook 21); redundant `hipMemcpy` H2D/D2H on this
+  APU → unified memory (Playbook 14); LDS bank conflicts, low occupancy,
+  or non-coalesced access → Playbooks 4 / 3 / 6. It is a menu, not a mandate:
   classify the dominant kernel's bottleneck via the KB's "How to pick a
   play" gate FIRST, then apply only a play whose profile signature matches.
   Cite the playbook number you used in the report.
@@ -1648,14 +1656,11 @@ this cluster are noise-dominated for any delta below ~20 %.
 **Replication contract — no FOM claim on <3 reps.** Before declaring
 any regression, improvement, or speed-up:
 
-- Run the **un-instrumented** FOM command at least 3 times. The shell
-  pattern (no extra tooling required):
+- Run the **un-instrumented** FOM command at least 3 times, via the
+  Rule 17 helper (`rocbudai-submit --gpus N` for multi-rank):
 
   ```bash
-  for i in 1 2 3; do
-      /usr/bin/time -f "rep=$i real=%e" \
-          mpirun --oversubscribe -np N ./app <args>
-  done
+  rocbudai-bench -n 4 -- ./app <args>   # 3 effective reps
   ```
 
   Use the median, not the mean — it's robust to the one outlier per
@@ -1685,6 +1690,9 @@ conclusion is:
 
 > `[INFERENCE] inconclusive — kernel and wall disagree; re-run
 > un-instrumented to confirm.`
+
+(Wall/throughput FOMs only; for a kernel-time FOM the multi-rep
+kernel-sum decides and wall disagreement is a secondary `[INFERENCE]`.)
 
 **Never declare best/worst on a single signal when the other signal
 contradicts it.** Observed in D-3 iter04: kernel-sum 366.5 µs (the
@@ -1803,7 +1811,7 @@ revert. See §1 rule 10 for the full contract.)
 
 ---
 
-# <app name> — rocBudAI iteration NN
+## Iteration NN — <app name>
 
 **Command profiled.** `./<binary> <args>`
 **ROCm version.** `rocm/<ver>`
@@ -1813,7 +1821,7 @@ revert. See §1 rule 10 for the full contract.)
 
 - **[FACT]** kernel `<name>` ran in <X> us (<source: filename:lineno or
   CSV row>)
-- **[FACT]** total wall time <Y> s (`time ./…` line)
+- **[FACT]** total wall time <Y> s (`rocbudai-bench` median)
 - **[INFERENCE]** kernel is <memory-bound | compute-bound> based on
   <roofline / occupancy / bandwidth observation>
 
@@ -1833,7 +1841,7 @@ revert. See §1 rule 10 for the full contract.)
 
 ## Re-measurement
 
-- **[FACT]** new kernel time <X′> us
+- **[FACT]** new kernel time <X′> us (median, Rule 17)
 - **[FACT]** speed-up <X/X′>×
 - **[INFERENCE]** improvement is real / within noise / regression
   because <evidence>
