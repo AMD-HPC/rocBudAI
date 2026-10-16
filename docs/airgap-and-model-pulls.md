@@ -1,4 +1,4 @@
-# rocBudAI — airgap design and model-pull procedure
+# rocBudAI: airgap design and model-pull procedure
 
 This document is the design rationale and the operational procedure
 for the rocBudAI airgap baseline: what it does, why it has the shape
@@ -10,11 +10,6 @@ the per-file deployment map) and to the `Airgap baseline` section of
 `INSTALL.md` (which is the step-by-step install recipe). Read this
 file when you want to understand *why* each piece is shaped the way
 it is, or when you need the model-pull recipe.
-
-The rules match the ollama user by name (`skuid "ollama"`), which nft
-resolves to the UID at load time, and rely on the RFC1918 allow to cover
-the site DNS resolver — so they are portable as-is. Substitute your
-cluster's values only if your resolver lives on a public IP.
 
 ---
 
@@ -54,17 +49,21 @@ user-side commands stay on the cluster while the allocation runs.
 
 Project-local templates at
 `/shared/apps/ubuntu/opt/rocbudai/share/rocbudai/opencode-default.json`
-already set `autoupdate:false` and `share:"disabled"` *for sessions
-started via `rocbudai-tui`*. Nothing else protects a bare `opencode`
-invocation in the same allocation.
+already set `share:"disabled"` *for sessions started via
+`rocbudai-tui`*. Nothing else protects a bare `opencode` invocation in
+the same allocation.
 
-opencode reads, in this order (highest precedence wins
-on conflict): `/etc/opencode/opencode.json` → `~/.config/opencode/opencode.json`
-→ `<project>/opencode.json`. The site-managed file is the only one a
-user cannot rewrite, which is why the lockdown lives there. Verified
-once on the reference cluster by staging a project with
-`"autoupdate": true` AND a managed file with `"autoupdate": false` —
-opencode behaved as if autoupdate was false.
+opencode reads, in this order (highest precedence wins on conflict):
+`/etc/opencode/opencode.json`, then `~/.config/opencode/opencode.json`,
+then `<project>/opencode.json`. The site-managed file is the only one a
+user cannot rewrite, which is why the lockdown lives there.
+`rocbudai-airgap-check` check 3c confirms that opencode accepts the
+managed file and resolves its `share` and `disabled_providers` values
+(from `/tmp`, so no project file is involved).
+
+Auto-update is not a JSON setting: opencode 1.14.28 ignores an
+`autoupdate` key, so it is disabled by the modulefile's
+`OPENCODE_DISABLE_AUTOUPDATE=1` (verified by check 3b).
 
 The managed file is deliberately minimal: it does **not** set `model`,
 `instructions`, or `permission` here — those are session/project-level
@@ -77,7 +76,6 @@ abbreviated form for reference:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "autoupdate": false,
   "share": "disabled",
   "disabled_providers": [
     "anthropic", "openai", "openrouter", "google", "gemini",
@@ -178,9 +176,13 @@ rocbudai-airgap-check --deep       # also dumps nft contents (sudo)
 ```
 
 Exit code 0 ⇔ baseline intact. The tool reports pass / fail / warn
-for the four pieces (managed opencode config, daemon hardening,
-egress block, daemon reachability) and prints an informational note
-that the user's own UID is *not* blocked by design.
+for the allocation context, daemon reachability and the `ollama`,
+`ollama-proxy`, and `ollama-egress` service states, the managed
+opencode config (including a live `opencode debug config` check)
+and the modulefile's `OPENCODE_DISABLE_*` vars, the daemon's
+`NOPRUNE` / `NO_CLOUD` hardening and loopback bind, and the per-job
+user-UID egress block. `--deep` adds the nft table contents and the
+usage-log hygiene check.
 
 ---
 
@@ -254,8 +256,8 @@ done
 #    layer, so the freshly-pulled manifest has no rocbudai operating
 #    rules at the inference root. Without this step, the model on
 #    every node will run with stock behaviour and silently regress.
-#    Applies to gpt-oss:120b, qwen3.5:122b, and nemotron-3-super:120b;
-#    other model names are skipped (no overlay shipped).
+#    Applies to every model with an overlay in deploy/ollama-models/
+#    (listed in its README); other model names are skipped.
 #
 #    The overlay Modelfile lives in the rocbudai repo at
 #    deploy/ollama-models/Modelfile.<sanitized-model-name>.rocbudai.
@@ -309,25 +311,25 @@ deliberately to test stock behaviour), see
 
 ## What the baseline does NOT cover
 
-- **Out-of-job state.** The user-UID block is per-job — installed by
-  the Slurm prolog on every `--comment=ollama` allocation, torn down
+- Out-of-job state: the user-UID block is per-job, installed by
+  the Slurm prolog on every `--comment=ollama` allocation and torn down
   by the epilog. Outside an allocation, the user UID has full network
-  egress — by design, so admin tooling and pre-staging dependencies
+  egress by design, so that admin tooling and pre-staging dependencies
   (`pip install`, `git clone https://…`, model downloads) work. Stage
   external dependencies BEFORE allocating with `--comment=ollama`.
-- **The login node.** No allocation runs on it, so no per-job chain;
+- The login node: no allocation runs on it, so no per-job chain;
   user UID has full egress. The egress block lives on compute nodes
   only.
-- **In-flight TCP connections at rule-load time.** The nft rules apply
+- In-flight TCP connections at rule-load time: the nft rules apply
   to new connections; conntrack may keep older ones alive. Restart
   the daemon after rule load if this matters.
-- **Recursive DNS via the cluster resolver.** A motivated user UID
+- Recursive DNS via the cluster resolver: a motivated user UID
   can still tunnel data over DNS queries; defenders against that
   threat model need a stricter setup (e.g. firejail, apptainer,
   `unshare -n`).
-- **Cluster admins.** They can read NFS contents directly. Trust in
+- Cluster admins: they can read NFS contents directly. Trust in
   cluster admins is implicit.
-- **IPv6 RFC4193 (ULA).** The reference cluster is IPv4-only today.
+- IPv6 RFC4193 (ULA): the reference cluster is IPv4-only today.
   If IPv6 is ever enabled, add `ip6 daddr fc00::/7 accept` to the
   nft chain.
 

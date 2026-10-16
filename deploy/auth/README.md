@@ -54,7 +54,7 @@ Short version:
 Each layer is meant to stop a different class of bypass:
 
 - Layer 1 alone is not enough — anyone on the same node can `curl 127.0.0.1:11435`.
-- Layer 2 alone is not enough — a process running as the `ollama` UID could still mutate (and the proxy itself runs as root and forwards to `:11435`, so we couldn't drop the ACL even if we wanted to).
+- Layer 2 alone is not enough — a process running as the `ollama` UID could still mutate (and the proxy itself runs as the `ollama` UID and forwards to `:11435`, so that UID must stay in the ACL allow-list).
 - Layer 3 alone is not enough — a determined user could `curl 127.0.0.1:11435` directly.
 - Layer 4 alone is not enough — it's a shell wrapper; bypassed by anyone using `curl` directly or invoking `/usr/local/bin/ollama-real`.
 - Layer 5 catches the FS-level bypass (group `ollama` no longer writeable from outside the daemon).

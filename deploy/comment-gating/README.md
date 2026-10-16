@@ -19,7 +19,7 @@ installs the drop-ins under `${SLURMSCRIPTS_DIR}/{prolog.d,epilog.d}` instead.
 | File | Where it goes when promoted | Purpose |
 |---|---|---|
 | `job_submit.lua` | `/etc/slurm/job_submit.lua` (login node only; one file replaces the existing one) | Adds Rule 2: `--comment=ollama` requires `--exclusive` and an SPX-only partition. Mismatched allocations are rejected at submit time. |
-| `rocbudai-ollama-prolog.sh` | `/shared/share/slurmscripts/prolog.d/rocbudai-ollama-prolog.sh` (cluster-wide; one copy via NFS; mode 755 root:root) | Runs at job start. If `ollama` ∈ comment tokens: starts `ollama.service` + `ollama-proxy.service`, waits up to 10 s for proxy readiness, pre-warms the default `qwen3.5:122b` via `systemd-run --no-block`. Fail-open. |
+| `rocbudai-ollama-prolog.sh` | `/shared/share/slurmscripts/prolog.d/rocbudai-ollama-prolog.sh` (cluster-wide; one copy via NFS; mode 755 root:root) | Runs at job start. If `ollama` ∈ comment tokens: refreshes the GPU/CPU fence drop-in from the node's live topology (`libexec/rocbudai-detect-topology.sh --write-fence`), starts `ollama.service` + `ollama-proxy.service`, waits up to 10 s for proxy readiness, pre-warms the default `qwen3.5:122b` via `systemd-run --no-block`. Fail-open. |
 | `rocbudai-ollama-epilog.sh` | `/shared/share/slurmscripts/epilog.d/rocbudai-ollama-epilog.sh` (cluster-wide; one copy via NFS; mode 755 root:root) | Runs at job end. If `ollama` ∈ comment tokens: posts `keep_alive:0` to release VRAM, stops proxy, stops daemon. Best-effort. |
 | `rocbudai-egress-prolog.sh` | `/shared/share/slurmscripts/prolog.d/rocbudai-egress-prolog.sh` (cluster-wide; one copy via NFS; mode 755 root:root) | Runs at job start. If `ollama` ∈ comment tokens: installs a per-job nft chain in the `inet rocbudai_user_egress` table (see `deploy/airgap/`) allowing loopback + DNS (read from `/etc/resolv.conf`) + RFC1918 and REJECTing all other egress from the job user's UID. Fail-closed. |
 | `rocbudai-egress-epilog.sh` | `/shared/share/slurmscripts/epilog.d/rocbudai-egress-epilog.sh` (cluster-wide; one copy via NFS; mode 755 root:root) | Runs at job end. Removes the per-job nft chain installed by the egress prolog drop-in; also cleans up orphans from a crashed prolog. Best-effort. |
@@ -97,7 +97,7 @@ Short version:
 
 Recognised tokens today:
 
-- `ollama`         — required for any rocBudAI job; node-wide ollama daemon + 4-GPU model.
+- `ollama`         — required for any rocBudAI job; node-wide ollama daemon serving the model on all GPUs except those reserved for `rocbudai-bench`.
                      Always inherits the cluster-wide airgap baseline (see `deploy/airgap/`).
 - `cpx` / `tpx`    — orthogonal; rocm-smi GPU-mode change. Pre-existing rule.
 

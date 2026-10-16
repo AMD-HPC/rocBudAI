@@ -1196,7 +1196,11 @@ step_6_drop_modulefile() {
     local src="${INSTALL_ROOT}/modulefiles/rocbudai/${modfile}"
     local dst_dir="${SITE_MODULES}/rocbudai"
     local dst="${dst_dir}/${modfile}"
-    [[ -f "${src}" ]] || die "Missing ${flavor} modulefile: ${src}"
+    # Under --dry-run step 5 only printed the copy, so INSTALL_ROOT may not exist;
+    # check the repo file it would have staged instead.
+    local src_check="${src}"
+    [[ ${DRY_RUN} -eq 1 ]] && src_check="${REPO_ROOT}/modulefiles/rocbudai/${modfile}"
+    [[ -f "${src_check}" ]] || die "Missing ${flavor} modulefile: ${src_check}"
 
     run_root mkdir -p "${dst_dir}"
     run_root cp "${src}" "${dst}"

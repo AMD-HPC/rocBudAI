@@ -5,8 +5,8 @@
 # Offline test runner — runs every static/unit test that needs no GPU, no
 # ROCm, and no network. This is what CI runs on every push/PR.
 #
-# Live behavior checks that need a running Ollama + model live under
-# tests/eval/ and are NOT run here (see tests/eval/README.md).
+# Live checks that need a running Ollama + model (tests/check-model.sh) are
+# NOT run here (see tests/README.md).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

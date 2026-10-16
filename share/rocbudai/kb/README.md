@@ -2,9 +2,9 @@
 
 This directory is the **default knowledge base** that ships with rocBudAI. It
 covers only profiling/optimization tooling that is present in a stock ROCm
-installation, so it is safe to use anywhere ROCm is installed — including the
-`--container` quick-test mode, which has no access to the admin-curated KB on
-`/shareddata/rocbudai/docs/inputs/`.
+installation, so it is safe to use anywhere ROCm is installed. The arch personas
+fall back to it (§7) when neither `$ROCBUDAI_KB_INPUTS_DIR` nor the admin-curated
+KB on `/shareddata/rocbudai/docs/inputs/` exists.
 
 All documents here are derived from **public** AMD material (public training
 decks / hand-written public notes), hence the `amd-public` origin tag in each
@@ -18,7 +18,7 @@ base set (see the resolution order in `AGENTS-default.md` §7).
 | `general__rocprof-compute-knowledge-base__amd-public__20260428.md` | `rocprof-compute` (omniperf successor) |
 | `general__rocprofv3-rocprof-sys-knowledge-base__amd-public__20260428.md` | `rocprofv3` / `rocprof-sys` tracing |
 | `general__rocpd-knowledge-base__amd-public__20260428.md` | `rocpd` profiling database |
-| `general__perf-optimization-plays__amd-public__20260609.md` | Generic optimization plays (MI300A-flavored; used by the arch-agnostic container persona) |
+| `general__perf-optimization-plays__amd-public__20260609.md` | Generic optimization plays (MI300A-flavored; referenced only by `AGENTS-default-container.md`) |
 | `general__perf-optimization-plays-mi300a__amd-public__20260714.md` | Optimization plays — MI300A (gfx942 CDNA3 APU) |
 | `general__perf-optimization-plays-mi300x__amd-public__20260714.md` | Optimization plays — MI300X (gfx942 CDNA3 discrete) |
 | `general__perf-optimization-plays-mi250x__amd-public__20260714.md` | Optimization plays — MI250X (gfx90a CDNA2) |
@@ -26,8 +26,9 @@ base set (see the resolution order in `AGENTS-default.md` §7).
 
 Each hardware persona (`AGENTS-default.md`, `AGENTS-gfx942-mi300x.md`,
 `AGENTS-gfx90a.md`, `AGENTS-gfx950.md`) reads its own arch-suffixed doc via the
-§7 KB resolution; the container persona (`AGENTS-default-container.md`) reads the
-unsuffixed generic doc.
+§7 KB resolution. `AGENTS-default-container.md` reads the unsuffixed generic doc,
+but `rocbudai-tui` does not select that persona: the `--container` quick-test uses
+the compact `AGENTS-container-demo.md`, which reads no KB.
 
 ## Naming convention
 

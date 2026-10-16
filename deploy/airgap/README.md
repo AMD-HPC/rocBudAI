@@ -1,24 +1,25 @@
 # Airgap baseline
 
-Source artefacts that stop the ollama daemon, opencode, AND the user's
+Source artefacts that stop the ollama daemon, opencode, and the user's
 own commands from reaching the internet while a `--comment=ollama`
 allocation is running. Four pieces:
 
 1. A managed `/etc/opencode/opencode.json` that pins `share:"disabled"`
    and 14 disabled cloud providers (overrides any project-local config).
 2. `OPENCODE_DISABLE_{AUTOUPDATE,LSP_DOWNLOAD,MODELS_FETCH,
-   EXTERNAL_SKILLS,SHARE}=1` set by the modulefile — suppresses every
-   known opencode phone-home call site.
+   EXTERNAL_SKILLS,SHARE}=1` set by the modulefile, which suppress every
+   known opencode phone-home call site (auto-update included: opencode
+   1.14.28 has no JSON setting for it).
 3. `OLLAMA_NOPRUNE=1` + `OLLAMA_NO_CLOUD=1` in the systemd unit
-   (lives in `deploy/ollama-daemon/ollama.service`, NOT here — the
-   env vars are part of the base unit, not a separate file).
+   (in `deploy/ollama-daemon/ollama.service`, not here: the env vars are
+   part of the base unit, not a separate file).
 4. Two kernel-firewall egress blocks (nft owner-match):
-   - **always-on** — `ollama-egress.service` rejects external traffic
+   - always-on: `ollama-egress.service` rejects external traffic
      from the `ollama` UID at boot.
-   - **per-job** — `rocbudai-user-egress.service` loads a skeleton
+   - per-job: `rocbudai-user-egress.service` loads a skeleton
      table at boot; the Slurm prolog/epilog (see
      `/shared/share/slurmscripts/{prolog,epilog}/`) extends it with a
-     per-job chain that rejects external traffic from the **user UID**
+     per-job chain that rejects external traffic from the user UID
      for the duration of every `--comment=ollama` allocation and
      removes it on epilog.
 
@@ -34,40 +35,44 @@ allocation is running. Four pieces:
 
 ## Companion documentation
 
-Design rationale, the model-pull-and-relock procedure (how an admin
-pulls a new model after the cluster is airgapped), and the
-end-to-end `gemma4:12b` proof-of-life live in
+Design rationale and the model-pull-and-relock procedure (how an admin
+pulls a new model after the cluster is airgapped) live in
 `docs/airgap-and-model-pulls.md`.
 
 ## Promotion checklist
 
 Short version:
 
-1. **Drop `opencode-managed.json`** at `/etc/opencode/opencode.json`
+1. Drop `opencode-managed.json` at `/etc/opencode/opencode.json`
    on one compute node; verify `opencode debug config` shows it as
    the active config (overrides any project-local one).
-2. **Replicate to all SPX nodes** + the Warewulf chroot.
-3. **Drop `ollama-egress.nft`** at `/etc/nftables.d/` on one node;
+2. Replicate it to all SPX nodes and the Warewulf chroot.
+3. Drop `ollama-egress.nft` at `/etc/nftables.d/` on one node;
    `sudo nft -f /etc/nftables.d/ollama-egress.nft`; verify the table
    is loaded (`sudo nft list table inet ollama_egress`).
-4. **Drop `ollama-egress.service`** at `/etc/systemd/system/`;
+4. Drop `ollama-egress.service` at `/etc/systemd/system/`;
    `sudo systemctl daemon-reload && sudo systemctl enable --now ollama-egress.service`.
-5. **End-to-end test**: as `ollama` UID, `curl https://huggingface.co`
+5. Drop `rocbudai-user-egress.nft` at `/etc/nftables.d/` and
+   `rocbudai-user-egress.service` at `/etc/systemd/system/`;
+   `sudo systemctl daemon-reload && sudo systemctl enable --now rocbudai-user-egress.service`.
+   Without this skeleton table the egress prolog fails closed (aborts the job).
+6. End-to-end test: as the `ollama` UID, `curl https://huggingface.co`
    should return REJECTed (`admin-prohibited`); `curl http://127.0.0.1:11434/api/version`
    should still work; `curl http://10.x.x.x` (an RFC1918 destination) should still work.
-6. **Replicate to all SPX nodes** + chroot.
-7. **Bake** into Warewulf chroot for re-provision survival.
+7. Replicate steps 3-5 to all SPX nodes and the chroot.
+8. Bake everything into the Warewulf chroot so it survives re-provision.
 
 ## User-facing verification
 
 After a user runs `module load rocbudai` on a `--comment=ollama`
 allocation, they can verify the baseline themselves with
 `rocbudai-airgap-check` (no sudo) or `rocbudai-airgap-check --deep`
-(also dumps the nft table contents — sudo). The tool ships in
+(also dumps the nft table contents; needs sudo). The tool ships in
 `bin/rocbudai-airgap-check` and reports pass / fail / warn for:
 
+- the allocation context (a `--comment=ollama` Slurm job on a compute node),
 - managed `/etc/opencode/opencode.json` flags
-   (`share=disabled`, `autoupdate=false`, ≥10 disabled providers),
+   (`share=disabled`, ≥10 disabled providers),
 - `ollama` daemon reachable on `127.0.0.1:11434`,
 - `ollama.service` / `ollama-proxy.service` / `ollama-egress.service`
    all `active`,
@@ -78,11 +83,12 @@ allocation, they can verify the baseline themselves with
 - the per-job `rocbudai_user_egress` chain is installed for this
    allocation (user UID's external egress is REJECTed; loopback /
    cluster DNS / RFC1918 still reachable),
-- `opencode debug config` live-resolver check (section 3c) — confirms
+- `opencode debug config` live-resolver check (section 3c), which confirms
    opencode actually accepts the managed config (not silently
    falling back to defaults on a schema-rejected key).
 
-Exit code 0 ⇔ baseline intact. Use this in onboarding when you
+`--deep` adds the nft table contents and the usage-log hygiene check.
+Exit code 0 means the baseline is intact. Use this in onboarding when you
 need an industry partner to *see* the airgap, not just be told
 about it.
 

@@ -97,7 +97,7 @@ inference root, **before** any user message. Models follow `SYSTEM`
 rules statistically more reliably than rules embedded mid-conversation.
 
 The 5 rules in the SYSTEM overlay are the **most-violated subset** of
-the full 24-rule `AGENTS.md`. The overlay is intentionally short
+the full 26-rule `AGENTS.md`. The overlay is intentionally short
 (~80 tokens out of the model's 256K context) so it does not
 crowd out user input. The full ruleset stays in `AGENTS.md` with
 all the rationale, examples, and observed-violation history.

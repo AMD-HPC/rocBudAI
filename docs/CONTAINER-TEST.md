@@ -53,15 +53,10 @@ container, and a smaller
 tools-less model like `tinyllama` (~640 MB) would silently break
 `ollama launch opencode` because opencode wires the model into its
 bash/edit/etc. via tool calls. To install with a different model,
-edit the `MODEL_NAME=` line in the `CONFIGURATION` block at the top
-of `install.sh` before running it; if you need to squeeze under
+set `MODEL_NAME=` in `site.conf` (see `site.conf.example`) before
+running `install.sh`; if you need to squeeze under
 ~17 GB, `qwen3:0.6b` (~500 MB) is the smallest tools-enabled
 alternative in the Qwen family.
-
-> **MI300A unified-memory fix.** rocBudAI pins `ollama` to a release
-> that already contains the fix for zero-VRAM reporting on MI300A APUs,
-> so the stock pinned binary loads models with no rebuild or patch
-> step. See [`../INSTALL.md`](../INSTALL.md) step 1 for the details.
 
 ## One-time env setup
 
@@ -151,7 +146,7 @@ green:
 1. Slurm allocation
   [ ok ]   in Slurm allocation: job 1
   [ ok ]   allocation comment contains 'ollama' (resolved via scontrol: 'ollama')
-  [ ok ]   on a supported SPX MI300A partition: 'test'
+  [ ok ]   on an allowed partition: 'test'
 ```
 
 A red `[FAIL]` or yellow `[warn]` line is paired with a one-line
@@ -196,7 +191,7 @@ don't always inherit `SLURM_JOB_COMMENT`); `test-env.sh` just
 stands in for that machinery.
 
 If the TUI bails with an error mentioning `--comment is '(none)'`,
-`partition is 'test', which is not an SPX MI300A partition`, or
+`partition is 'test', which is not in the rocBudAI allow-list`, or
 `ROCBUDAI_MODEL=... is not in the admin allow-list`, double-check
 that you `source`d `test-env.sh` in the *same* shell you're running
 `rocbudai-tui` from (env vars from a previous `module load` or a

@@ -10,7 +10,7 @@ Tiers 1–3 first.
 
 | Tier | What you run | Needs a GPU? | Needs Slurm? | Changes the system? | Proves |
 |---|---|---|---|---|---|
-| **1 — Dry run** | `./install.sh --dry-run …` | No | No | **No** | The flags, paths, arch→persona mapping, and step plan are correct |
+| **1 — Dry run** | `./install.sh --dry-run …` | No | No | **No** | The flags, paths, detected arch, and step plan are correct |
 | **2 — Container quick-test** | `./install.sh --container` | Yes (inside `salloc`) | Yes (you're in an allocation) | Only inside a throwaway container | The full install runs end-to-end and the TUI launches |
 | **3 — Full-stack container** | manual install in a container + `test-env.sh` | Optional | No (faked via env) | Only inside the container | `rocbudai-doctor` + `rocbudai-tui` pass every gate on a no-systemd host |
 | **4 — Real cluster smoke test** | `salloc` on a real node + `module load rocbudai` | **Yes** | **Yes (real)** | **Yes (the deploy)** | Production behaviour: systemd, multi-GPU spread, auth proxy, `--comment=ollama` gating |
@@ -21,7 +21,7 @@ larger `qwen3.5:122b`. Use the small one for all testing: it must
 expose `tools` in Ollama (which `ollama launch opencode` requires),
 and being small it keeps the cold-start short. The container
 quick-test pairs it with a compact, self-contained demo persona
-(`AGENTS-container-demo.md`) rather than the full ~2,100-line arch
+(`AGENTS-container-demo.md`) rather than the full ~2,200-line arch
 persona, so a small model follows the demo flow reliably.
 
 ---
@@ -30,9 +30,8 @@ persona, so a small model follows the demo flow reliably.
 
 **Goal:** confirm the installer will do what you expect *without
 touching the system*. `--dry-run` prints every step it would take
-(packages, paths, the modulefile it would write, the GPU
-architecture it detected, and the AGENTS persona it would bake in)
-and exits without making changes.
+(packages, paths, the modulefile it would write, and the GPU
+architecture it detected) and exits without making changes.
 
 ```bash
 cd ~/rocBudAI
@@ -56,10 +55,10 @@ cd ~/rocBudAI
 
 - The script exits 0 with no errors.
 - The detected/selected GPU architecture is what you expect.
-- The AGENTS persona it reports baking into the modulefile matches
-  the   architecture (e.g. `AGENTS-gfx950.md` for `--gfx-arch gfx950`,
-  `AGENTS-default.md` (MI300A APU) vs `AGENTS-gfx942-mi300x.md`
-  (MI300X discrete) for the two gfx942 SKUs).
+- There is no persona to check here: the AGENTS persona is not baked at
+  install time; `rocbudai-tui` picks it from the live GPU on the compute
+  node. The arch→persona mapping itself is covered offline by
+  `tests/test-persona-resolver.sh`.
 - The install paths and partition match your site.
 
 This tier needs no hardware and changes nothing, so run it freely

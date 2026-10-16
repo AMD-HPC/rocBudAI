@@ -7,6 +7,8 @@
 - `test-repo-hygiene.sh` — locks in the IP-review remediations (no `@amd.com`,
   `amd-internal`, `7.13`, stale model tags), validates `opencode-*.json`, and
   keeps `kb/` in sync with `kb/README.md`.
+- `test-topology-resolver.sh` — asserts the GPU/CPU split derived by
+  `libexec/rocbudai-detect-topology.sh` from synthetic sysfs fixtures.
 
 `.github/workflows/ci.yml` runs this plus `shellcheck` on every push/PR.
 

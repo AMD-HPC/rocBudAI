@@ -1,9 +1,9 @@
 # rocBudAI knowledge base — inputs
 
 This document describes how the agent's knowledge base works and how
-to populate it. The KB is **site-populated**: rocBudAI does not ship
-prior-knowledge content in the repo (license-cleared reference material
-may follow as a separate dataset; until then, each site curates its own).
+to populate it. The KB is **site-populated**: beyond a small base set of
+public ROCm-tool docs and optimization plays in `share/rocbudai/kb/` (see its
+`README.md`), each site curates its own.
 
 ## TL;DR — what to do
 
@@ -57,8 +57,8 @@ Examples:
 
 ## Why PDFs need a `.md` sidecar
 
-The LLMs behind rocBudAI (currently `qwen3.5:122b` default plus
-`gpt-oss:120b` / `nemotron-3-super:120b` opt-in; run `module show
+The LLMs behind rocBudAI (currently `qwen3.5:122b` by default, with the
+other allow-listed models opt-in; run `module show
 rocbudai` to see what is active and `module help rocbudai` for the
 admin allow-list) are
 **text-only**. They have no image encoder and no PDF parser.

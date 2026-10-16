@@ -2,8 +2,10 @@
 
 Source artefacts that mirror the NFS-shared Ollama model store
 (`/shareddata/Ollama_Models/`) onto each SPX node's local NVMe at boot
-and reroute the ollama daemon to read from there. Cuts cold-start
-from ~9-10 min to ~30 s.
+and reroute the ollama daemon to read from there. Cuts the
+user-perceived cold-start from ~9-10 min to ~1 min. It is invisible to
+users (no new Slurm comment grammar): existing `--comment=ollama`
+allocations just start fast.
 
 ## Why this exists (measured)
 
@@ -13,6 +15,12 @@ Measured on a reference MI300A SPX node (idle, post-`drop_caches`):
 |---|---|---|
 | NFS (`/shareddata/Ollama_Models`) | 112 MB/s | ~580 s (~9.7 min) |
 | Local NVMe (`/dev/nvme0n1p3`)     | 2.5 GB/s | ~26 s |
+
+End to end, the NFS-backed cold-start was 578 s (8 s daemon start + 570 s
+first generate) and the cache-backed one 57 s (7 s daemon start + 50 s first
+generate). The 10× speedup comes from the bandwidth gap above on the 65 GB
+`gpt-oss:120b` weights blob (the then-default model); the mechanism is
+model-agnostic and applies equally to the current default `qwen3.5:122b`.
 
 Many cluster prologs run `echo 3 > /proc/sys/vm/drop_caches` at every
 job start (the reference cluster does), which means RAM-only page-cache
@@ -31,22 +39,17 @@ tracks the model store automatically and is not set here.
 | `rocbudai-model-cache.service` | `/etc/systemd/system/` (each SPX node + chroot) | Boot-time `rsync /shareddata/Ollama_Models/ → /var/local/cache/ollama/` (Type=oneshot, runs Before=ollama.service) |
 | `ollama-models-cache.conf`     | `/etc/systemd/system/ollama.service.d/model-cache.conf` (each SPX node + chroot) | Drop-in that overrides `OLLAMA_MODELS=/var/local/cache/ollama` and adds Requires/After on the cache service |
 
-The cache service is **per-node**, not cluster-wide. Each SPX node
+The cache service is per-node, not cluster-wide. Each SPX node
 holds its own 65 GB local copy of the model store.
 
 ## Disk footprint
 
-gpt-oss:120b on disk: one ~61 GB weights blob plus 4 small
+gpt-oss:120b (the then-default model) on disk: one ~61 GB weights blob plus 4 small
 config/template/license/params blobs. Total ~62 GB.
 
 On `/dev/nvme0n1p3` (mounted at `/`), 685 GB free of 1.8 TB.
 Plenty of headroom for additional models (Llama 3.x 70B, etc.) if
 they're added later.
-
-## Slurm comment grammar
-
-N/A. This is invisible to the user — just makes existing
-`--comment=ollama` allocations start fast.
 
 ## Deployment
 
@@ -109,12 +112,12 @@ t1=$(date +%s.%N)
 echo "cold-start total: $(python3 -c "print(f'{$t1 - $t0:.1f}s')")"
 ```
 
-Expected: ~30 s with the cache, ~9-10 min without.
+Expected: ~1 min with the cache (57 s measured), ~9-10 min without.
 
 ## Admin model-pull workflow (post-deployment)
 
 Because `OLLAMA_MODELS` now points at the local cache, a new `ollama
-pull` lands in `/var/local/cache/ollama/` on the pull node — **not** in
+pull` lands in `/var/local/cache/ollama/` on the pull node, not in
 the NFS store. To make it visible cluster-wide you must push the new
 blobs back to NFS and re-sync the other nodes:
 
@@ -126,8 +129,8 @@ for n in <other-spx-nodes>; do
 done
 ```
 
-The full recipe — lifting the egress block, the pull itself, and the
-mandatory SYSTEM-overlay re-augmentation — lives in
+The full recipe (lifting the egress block, the pull itself, and the
+mandatory SYSTEM-overlay re-augmentation) lives in
 [`../../docs/airgap-and-model-pulls.md`](../../docs/airgap-and-model-pulls.md).
 
 ## Rollback
@@ -148,13 +151,13 @@ again, but everything else still works.
 
 ## Known limitations
 
-- **Cluster-wide model pull requires the post-pull rsync step**
+- A cluster-wide model pull requires the post-pull rsync step
   documented above. If an admin forgets, the new model is invisible
   on other SPX nodes until their next boot.
-- **First boot pays ~9-10 min for the initial sync**. Subsequent
+- The first boot pays ~9-10 min for the initial sync. Subsequent
   boots: seconds (delta-only). The initial cost is unavoidable
   unless we ship a pre-baked image that already contains the model
   blob — possible but adds 65 GB to every Warewulf image.
-- **Cache is read-only from non-admin users.** UID `ollama` and root
+- The cache is read-only for non-admin users. UID `ollama` and root
   can read; other UIDs would need group membership in `ollama` if
   they ever need direct access. Today nothing else reads the cache.
