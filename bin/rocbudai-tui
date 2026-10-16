@@ -1114,6 +1114,32 @@ export OPENCODE_DISABLE_SHARE="${OPENCODE_DISABLE_SHARE:-1}"
 # guarantees the persona loads. `:-` keeps any explicit caller override.
 export OPENCODE_CONFIG="${OPENCODE_CONFIG:-${cwd}/opencode.json}"
 
+# `ollama launch` injects reasoningEffort "medium" for gpt-oss at opencode's
+# highest config precedence; only opencode's stored per-model variant
+# overrides it. Seed "high" once and leave any variant the user has chosen.
+if [[ "$ROCBUDAI_MODEL" == gpt-oss* ]]; then
+    OC_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/opencode/model.json" \
+    OC_KEY="ollama/${ROCBUDAI_MODEL}" python3 - <<'PY' \
+        || warn "could not seed the gpt-oss reasoning variant; select 'high' with /variants"
+import json, os, sys
+path, key = os.environ["OC_STATE"], os.environ["OC_KEY"]
+try:
+    with open(path) as f:
+        state = json.load(f)
+except FileNotFoundError:
+    state = {}
+except ValueError:
+    sys.exit(1)
+variants = state.setdefault("variant", {})
+if key not in variants:
+    variants[key] = "high"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+    print(f"[rocbudai-tui] reasoning effort for {key}: high (change with /variants)")
+PY
+fi
+
 info "rocbudai (dev) on $(hostname) (job ${SLURM_JOB_ID:-(not in alloc)})"
 info "model: ${ROCBUDAI_MODEL}   cwd: ${cwd}"
 

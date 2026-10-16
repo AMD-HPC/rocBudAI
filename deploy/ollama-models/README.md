@@ -18,6 +18,20 @@ layers are inherited via `FROM` (the `num_thread` parameter merges into the
 stock params); the overlay adds a `vnd.ollama.image.system` layer with the
 rocbudai rules.
 
+The four production overlays also pin `PARAMETER num_ctx` to the
+`limit.context` of the same model in `share/rocbudai/opencode-*.json`
+(131072 for gpt-oss, 262144 for the others). Unpinned, ollama 0.34.4 picks
+4k/32k/256k from the visible VRAM, and `chatPrompt` drops the oldest
+messages of a longer prompt with only a debug log, while opencode still
+compacts against its own limit. Keep the two values equal.
+
+Thinking and sampling that `/v1` requests can carry live in the opencode
+templates, not here: `ollama launch` sends no reasoning effort for
+non-gpt-oss models, and Laguna's `poolside-v1` renderer defaults thinking
+off, so its template entry sets `reasoningEffort` (any value maps to
+thinking on) plus Poolside's `temperature 1.0` / `top_p 1.0`. Only `top_k`,
+which `/v1` cannot carry, is pinned in the Laguna overlay.
+
 **Keep `PARAMETER num_thread 1` in every overlay.** With its default CPU
 thread count, ollama 0.34.4 leaves the GPUs idle and adds a fixed ~250 ms per
 token (three production models, default 128 threads vs `num_thread 1`:

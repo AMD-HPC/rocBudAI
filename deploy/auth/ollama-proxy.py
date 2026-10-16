@@ -20,6 +20,7 @@ Admin escape hatch: hit :11435 directly via sudo, e.g.
 
 import http.client
 import http.server
+import json
 import re
 import socketserver
 import sys
@@ -62,6 +63,33 @@ CTL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 # char can ride along. A re.fullmatch against this is the request-forgery
 # barrier (and a request-smuggling guard).
 SAFE_TARGET = re.compile(r"/(?:(?:api|v1)/[!-~]*)?")
+
+
+# opencode returns prior reasoning on assistant messages as `reasoning_content`
+# (its config schema allows no other name); ollama's /v1 reads only
+# `reasoning` and drops it. Applied to every served model so all are compared
+# on equal terms; it costs prompt tokens (about 15% for gpt-oss), so a model
+# shown to be hurt by it can be removed from this list on its own.
+CARRY_REASONING_MODEL_PREFIXES = ("gpt-oss:", "laguna-", "nemotron-", "qwen3.5:")
+
+
+def carry_reasoning(body):
+    try:
+        req = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(req, dict) or not str(req.get("model", "")).startswith(
+            CARRY_REASONING_MODEL_PREFIXES):
+        return body
+    changed = False
+    for msg in req.get("messages") or []:
+        if (isinstance(msg, dict) and msg.get("role") == "assistant"
+                and "reasoning_content" in msg):
+            text = msg.pop("reasoning_content")
+            if not msg.get("reasoning"):
+                msg["reasoning"] = text
+            changed = True
+    return json.dumps(req).encode() if changed else body
 
 
 def is_denied(path):
@@ -112,12 +140,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._reject(413, b"request body too large\n")
             return
         body = self.rfile.read(n) if n > 0 else None
+        if body and self.command == "POST" and \
+                urlsplit(target).path == "/v1/chat/completions":
+            body = carry_reasoning(body)
 
         fwd_headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() not in DROP_HEADERS
+            if k.lower() not in DROP_HEADERS | {"content-length"}
             and not (CTL_CHARS.search(k) or CTL_CHARS.search(v))
         }
+        if body is not None:
+            fwd_headers["Content-Length"] = str(len(body))
         fwd_headers["Connection"] = "close"
 
         try:

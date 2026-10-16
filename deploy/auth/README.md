@@ -26,7 +26,7 @@ baseline lives in `deploy/airgap/`.
 |---|---|---|
 | `ollama-acl.nft` | `/etc/nftables.d/ollama-acl.nft` (each compute node + chroot) | Layer 2: nft `inet ollama_acl` table. UID 0 and 997 → `accept`; everyone else → `reject` on tcp dport 11435. |
 | `ollama-acl.service` | `/etc/systemd/system/ollama-acl.service` (each node + chroot) | Loads the `.nft` file at boot, after `nftables.service`. |
-| `ollama-proxy.py` | `/usr/local/bin/ollama-proxy` (each node + chroot; mode 755 root:root) | Layer 3: Python reverse-proxy. Listens on `127.0.0.1:11434`, forwards reads to `127.0.0.1:11435`, returns `403 {"error": "..."}` on mutate endpoints. |
+| `ollama-proxy.py` | `/usr/local/bin/ollama-proxy` (each node + chroot; mode 755 root:root) | Layer 3: Python reverse-proxy. Listens on `127.0.0.1:11434`, forwards reads to `127.0.0.1:11435`, returns `403 {"error": "..."}` on mutate endpoints. For `/v1/chat/completions` requests to the models in `CARRY_REASONING_MODEL_PREFIXES` it renames opencode's `reasoning_content` to the `reasoning` field ollama reads, so prior thinking is preserved (Poolside requires this for Laguna; the other models get it for parity). |
 | `ollama-proxy.service` | `/etc/systemd/system/ollama-proxy.service` (each node + chroot) | systemd unit for the proxy. Started by the prolog when `--comment=ollama` is set (see `deploy/comment-gating/`); stopped by the epilog. |
 | `ollama-wrapper.sh` | `/usr/local/bin/ollama` (each node + chroot; mode 755 root:root) | Layer 4: CLI wrapper. Inspects `$1`; for mutate verbs and non-root caller, prints "permission denied: ask an admin" and exits 1. The real binary lives at `/usr/local/bin/ollama-real` (rename during install). |
 
