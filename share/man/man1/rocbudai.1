@@ -322,8 +322,9 @@ sidecars it judges relevant to your workload type, and cites them in
 You can extend the KB yourself by dropping files into the same
 directory:
 .IP \(bu 2
-\fB.pdf\fR \(em a \fBsystemd.path\fR watcher on the login node
-auto\-converts to a \fB.md\fR sidecar within seconds.
+\fB.pdf\fR \(em an hourly \fBsystemd.timer\fR on the login node
+auto\-converts to a \fB.md\fR sidecar (run
+\fBrocbudai\-ingest\-inputs\fR by hand for an immediate one).
 The PDF stays archival; the agent only ever reads the sidecar.
 .IP \(bu 2
 \fB.md\fR / \fB.txt\fR / \fB.html\fR \(em read directly, no

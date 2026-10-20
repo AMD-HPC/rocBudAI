@@ -18,9 +18,9 @@ Type=oneshot
 User=admin
 Group=adm
 
-# Use flock to ensure only one ingest at a time, even if the .path
-# unit fires in rapid succession (e.g. admin scp's 4 PDFs back-to-
-# back). `-n` would fail-fast on contention; we want to queue.
+# Use flock to ensure only one ingest at a time, even if the timer
+# and a manual run overlap. `-n` would fail-fast on contention; we
+# want to queue.
 ExecStart=/usr/bin/flock /var/lock/rocbudai-ingest-inputs.lock \
     /shared/apps/ubuntu/opt/rocbudai/bin/rocbudai-ingest-inputs --dir /shareddata/rocbudai/docs/inputs
 

@@ -1,10 +1,9 @@
 [Unit]
-Description=rocBudAI — periodic KB ingest fallback
+Description=rocBudAI — periodic KB ingest
 Documentation=man:rocbudai(1)
-# Belt-and-suspenders for the .path unit: catches the edge case where
-# a PDF was added via a non-login-node NFS mount (inotify on the login
-# node never fires for those). 1-hour cadence is a compromise between
-# "users notice in-session lag" and "needless NFS scans".
+# Sole trigger for the ingest: we ship no systemd.path watcher, whose implicit
+# NFS-mount dependency can cause a boot-time ordering cycle on infra nodes (see
+# the deploy README). 1-hour cadence trades in-session lag against NFS scans.
 
 [Timer]
 OnBootSec=15min

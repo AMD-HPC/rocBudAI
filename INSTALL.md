@@ -667,21 +667,26 @@ baseline also does not cover the login node, and it trusts cluster admins.
 #### Auto-ingest of KB documents
 
 Removes the manual `rocbudai-ingest-inputs` step admins would otherwise need
-to run every time they drop a new PDF into the KB. A `systemd.path` watcher on
-the login node invokes the existing converter within ~1 sec of
-`IN_CLOSE_WRITE` on `/shareddata/rocbudai/docs/inputs/`. A sibling `.timer`
-runs the same service hourly as a fallback for PDFs that arrive via NFS from
-non-login-node hosts (where inotify on the login node never sees them). The
-converter itself is unchanged and idempotent: multiple back-to-back path
-events do at most one pass of real work, and a `flock` in the service unit
+to run every time they drop a new PDF into the KB. A `systemd.timer` on the
+login node runs the existing converter hourly (plus once ~15 min after boot)
+over `/shareddata/rocbudai/docs/inputs/`, catching PDFs regardless of which
+host wrote them. The converter itself is unchanged and idempotent: a sweep that
+finds nothing new is a near-instant no-op, and a `flock` in the service unit
 serialises overlapping invocations.
 
+We deliberately do not ship a `systemd.path` (inotify) watcher. On an NFS-backed
+directory a `.path` unit implicitly depends on the backing mount, and enabled
+into `multi-user.target` on an infra node (NFS server + dnsmasq) it can close a
+boot-time systemd ordering cycle that drops `nfs-server`/`dnsmasq` at boot.
+inotify over NFS also never sees cross-host drops, so the timer was already the
+reliable trigger. See `deploy/auto-ingest/README.md` for the full rationale.
+
 Source artefacts (in this repo): `deploy/auto-ingest/`
-(`rocbudai-ingest-inputs.{path,service,timer}`, plus a `README.md` with the
+(`rocbudai-ingest-inputs.{service,timer}`, plus a `README.md` with the
 per-file deployment map and smoke-test recipe).
 
 Deploy it on the login node only. Do NOT bake it into the Warewulf chroot,
-since multi-host watchers would race on shared NFS state.
+since multi-host sweeps would race on shared NFS state.
 
 #### Local NVMe model cache
 

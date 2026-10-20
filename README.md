@@ -254,12 +254,11 @@ This section covers the day-to-day operation of rocBudAI.
 The agent reads from `/shareddata/rocbudai/docs/inputs/` at session start: it
 lists the directory, then reads the relevant `.md` sidecars.
 
-- A `.pdf` dropped on the login node triggers a `systemd.path` watcher
-  (`IN_CLOSE_WRITE`), and `rocbudai-ingest-inputs` writes a `.md` sidecar
-  within seconds. Conversion is idempotent: it re-converts only when the
-  source is newer.
-- A `.pdf` written over NFS from a host other than the login node is caught
-  by the hourly `rocbudai-ingest-inputs.timer` within 60 min.
+- A `.pdf` dropped anywhere in the KB inputs dir is picked up by the hourly
+  `rocbudai-ingest-inputs.timer`, and `rocbudai-ingest-inputs` writes a `.md`
+  sidecar within 60 min. Conversion is idempotent: it re-converts only when the
+  source is newer. For an immediate sidecar, run `rocbudai-ingest-inputs` by
+  hand on the login node.
 - A `.md`, `.txt`, or `.html` file needs no conversion and is visible at the
   next session. Name it `<workload-type>__<topic>__<source>__<yyyymmdd>.md`,
   following [kb-inputs.md](./docs/kb-inputs.md).
@@ -270,7 +269,7 @@ lists the directory, then reads the relevant `.md` sidecars.
 |---|---|
 | Drop while no TUI is running | Next `rocbudai` session |
 | Drop while user X has a TUI running | Next session of user X (the running one already snapshotted) |
-| Replace a `.pdf` with an updated version | Re-ingested on the next path event (mtime check) |
+| Replace a `.pdf` with an updated version | Re-ingested on the next hourly sweep (mtime check) |
 | User wants the running session to see the new doc | Tell the agent in chat: "list `/shareddata/rocbudai/docs/inputs/` and read any new files" |
 
 Operational checks: `journalctl -u rocbudai-ingest-inputs.service -n 20` for
@@ -429,9 +428,8 @@ Cluster-wide (NFS-shared; the Ollama models live on NFS):
 Login node only (not in the chroot; these run on the user's entry host):
 
 ```
-/etc/systemd/system/rocbudai-ingest-inputs.path     KB watcher (inotify)
 /etc/systemd/system/rocbudai-ingest-inputs.service  oneshot ingest runner
-/etc/systemd/system/rocbudai-ingest-inputs.timer    hourly fallback sweep
+/etc/systemd/system/rocbudai-ingest-inputs.timer    hourly ingest sweep
 ```
 
 ---

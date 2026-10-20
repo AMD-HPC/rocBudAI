@@ -209,7 +209,7 @@ Options:
       --with-hardening
                       Also install ALL step 8 features: ollama auth
                       hardening, --comment=ollama daemon gating, airgap
-                      baseline, auto-ingest path watcher (login node
+                      baseline, auto-ingest timer (login node
                       only), local NVMe model cache, daily usage
                       tracking. See INSTALL.md §8 for details. For
                       à-la-carte hardening, leave this flag off and
@@ -480,7 +480,7 @@ preflight() {
             warn "On this host, the following will be SKIPPED (logged again at each step):"
             (( WITH_AUTH        )) && warn "    - --with-auth          (ollama auth wrapper + proxy + acl)"
             (( WITH_AIRGAP      )) && warn "    - --with-airgap        (nft egress + ollama-egress.service)"
-            (( WITH_AUTO_INGEST )) && warn "    - --with-auto-ingest   (rocbudai-ingest-inputs.{path,timer})"
+            (( WITH_AUTO_INGEST )) && warn "    - --with-auto-ingest   (rocbudai-ingest-inputs.{service,timer})"
             (( WITH_MODEL_CACHE )) && warn "    - --with-model-cache   (rocbudai-model-cache.service)"
             warn "Steps 1-7 will still run normally. Re-run on a systemd host (or"
             warn "without --with-hardening) to install the gated features."
@@ -1430,25 +1430,26 @@ step_8_airgap() {
 }
 
 step_8_auto_ingest() {
-    section "Step 8 — Auto-ingest path watcher (login node only)"
+    section "Step 8 — Auto-ingest timer (login node only)"
     if ! have_systemd; then
-        warn "No systemd detected — skipping (path/timer units need systemd)."
+        warn "No systemd detected — skipping (service/timer units need systemd)."
         return 0
     fi
-    warn "Reminder: this MUST run on the login node only — multi-host watchers race on NFS."
+    warn "Reminder: this MUST run on the login node only — multi-host sweeps race on NFS."
 
+    # Timer + service only: no systemd.path watcher (its implicit NFS-mount dep
+    # can cause a boot-time ordering cycle on infra nodes). See the deploy README.
     local d="${REPO_ROOT}/deploy/auto-ingest"
-    for f in rocbudai-ingest-inputs.path rocbudai-ingest-inputs.service rocbudai-ingest-inputs.timer; do
+    for f in rocbudai-ingest-inputs.service rocbudai-ingest-inputs.timer; do
         run_root install -m 0644 -o root -g root "${d}/${f}" "/etc/systemd/system/${f}"
     done
 
-    # Retarget the watched KB inputs dir (in the .path PathChanged, the .service
-    # ConditionPathIsDirectory, and the ExecStart --dir) and the install-tree
-    # path baked into the .service ExecStart, if the site overrode them.
+    # Retarget the watched KB inputs dir (in the .service ConditionPathIsDirectory
+    # and the ExecStart --dir) and the install-tree path baked into the .service
+    # ExecStart, if the site overrode them.
     if [[ "${KB_INPUTS_DIR}" != "${KB_INPUTS_DIR_DEFAULT}" ]]; then
         info "Retargeting KB inputs dir → ${KB_INPUTS_DIR}"
         run_root sed -i "s#${KB_INPUTS_DIR_DEFAULT}#${KB_INPUTS_DIR}#g" \
-            /etc/systemd/system/rocbudai-ingest-inputs.path \
             /etc/systemd/system/rocbudai-ingest-inputs.service
     fi
     if [[ "${INSTALL_ROOT}" != "${INSTALL_ROOT_DEFAULT}" ]]; then
@@ -1457,7 +1458,6 @@ step_8_auto_ingest() {
     fi
 
     run_root systemctl daemon-reload
-    run_root systemctl enable --now rocbudai-ingest-inputs.path
     run_root systemctl enable --now rocbudai-ingest-inputs.timer
 }
 
