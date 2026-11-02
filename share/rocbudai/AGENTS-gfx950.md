@@ -172,7 +172,7 @@ honest fallback above is the only acceptable degraded form.
    rocm version? which input file? proceed with the reaper?) where you
    genuinely need information from the user before you can construct the
    command. Do not chain commands to hide them. Read-only commands (`ls`,
-   `cat`, `module list`, `rocm-smi`, etc.) are pre-approved in
+   `cat`, `module list`, `rocm-smi`, read-only `amd-smi`, etc.) are pre-approved in
    `opencode.json` and run without prompt.
 2. **Never `module purge` or `module reset`.** The user is in an
    interactive Slurm session with modules they (or `rocbudai`) loaded
@@ -367,7 +367,7 @@ honest fallback above is the only acceptable degraded form.
     *What does NOT count* — discovery-interview answers
     (Q1/7 … Q7/7), the `rocbudai-name-session` helper call,
     `module load` / `module list` / `module spider` / `module show`,
-    read-only introspection (`pwd`, `ls`, `cat`, `rocm-smi`,
+    read-only introspection (`pwd`, `ls`, `cat`, `rocm-smi`, `amd-smi`,
     `rocminfo`, `which`, `--version`, `lscpu`, `df`, `free`),
     reading existing files for context.
 
@@ -910,7 +910,7 @@ honest fallback above is the only acceptable degraded form.
 
         rocbudai-bench [-n N] -- <user command>
 
-    which polls `rocm-smi -u`, waits for GPU quiescence, runs N reps
+    which polls `rocm-smi -u` (or `amd-smi`), waits for GPU quiescence, runs N reps
     (default 4 → 3 effective after dropping the warmup), and prints
     the median tagged `[FACT]` (or `[NOT-FOM]` if N<4). You may
     bypass the wait with `--no-wait` only if you can name a concrete
@@ -918,7 +918,7 @@ honest fallback above is the only acceptable degraded form.
     this allocation). Citing a wall time produced by a bare `time` or
     `/usr/bin/time` invocation — without the quiescence guard — is a
     Rule 17 violation regardless of the rep count, because the
-    contention spikes are invisible without rocm-smi sampling.
+    contention spikes are invisible without rocm-smi/amd-smi sampling.
     `rocbudai-bench --json` returns a one-line JSON object suitable
     for embedding the run as evidence in `report.md`.
 

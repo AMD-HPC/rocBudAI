@@ -67,7 +67,8 @@
 #   -t, --timeout SEC        Max seconds to wait for GPU to quiesce
 #                            (default: 30). On timeout: WARN and proceed.
 #   -T, --threshold PCT      Per-GPU utilisation considered "busy"
-#                            (default: 5). Sampled from rocm-smi -u.
+#                            (default: 5). Sampled from rocm-smi -u
+#                            (amd-smi metric -u if rocm-smi is absent).
 #   -d, --quiet-duration N   How many consecutive 1 Hz quiet samples are
 #                            needed to declare quiescent (default: 3).
 #   --no-wait                Skip the quiescence wait (use only when you
@@ -82,7 +83,7 @@
 #   1  command failed on at least one rep (results suppressed, last-20
 #      lines from the failing rep emitted to stderr).
 #   2  bad usage / no command after `--`.
-#   3  rocm-smi not found (and --no-wait not given).
+#   3  neither rocm-smi nor amd-smi found (and --no-wait not given).
 #
 # EXAMPLES
 #   # Default: 4 reps, drop warmup, 3-rep median.
@@ -173,20 +174,24 @@ EOF
 # actually ships rocm-smi. We scan in descending version order and skip
 # *-patches-* trees: they sort ABOVE the real version dirs under `sort -V`
 # but contain no bin/rocm-smi, so a naive `tail -1` picks a dir with no
-# rocm-smi and the guard wrongly reports "not found".
+# rocm-smi and the guard wrongly reports "not found". amd-smi is searched
+# the same way only if no rocm-smi exists (ROCm 10+ ships only amd-smi;
+# before ROCm 7.1 amd-smi reports GPU use as "N/A").
 locate_rocm_smi() {
-    local p
-    if command -v rocm-smi >/dev/null 2>&1; then
-        command -v rocm-smi
-        return 0
-    fi
-    while IFS= read -r p; do
-        [[ "$p" == *-patches-* ]] && continue
-        if [[ -x "$p/bin/rocm-smi" ]]; then
-            echo "$p/bin/rocm-smi"
+    local p t
+    for t in rocm-smi amd-smi; do
+        if command -v "$t" >/dev/null 2>&1; then
+            command -v "$t"
             return 0
         fi
-    done < <(ls -d /opt/rocm-* 2>/dev/null | sort -Vr)
+        while IFS= read -r p; do
+            [[ "$p" == *-patches-* ]] && continue
+            if [[ -x "$p/bin/$t" ]]; then
+                echo "$p/bin/$t"
+                return 0
+            fi
+        done < <(ls -d /opt/rocm-* 2>/dev/null | sort -Vr)
+    done
     return 1
 }
 
@@ -199,6 +204,19 @@ sample_bench_pct() {
     local rocm_smi="$1"
     local gpu="$2"
     local out
+    if [[ "${rocm_smi##*/}" == amd-smi ]]; then
+        # JSON is a list, or {"gpu_data": [...]} from ROCm 7.0; a non-numeric
+        # gfx_activity (e.g. "N/A") is a failed sample.
+        out=$("$rocm_smi" metric -g "$gpu" -u --json 2>/dev/null) || return 1
+        python3 -c '
+import json, sys
+g = int(sys.argv[1]); d = json.load(sys.stdin)
+for r in (d.get("gpu_data", []) if isinstance(d, dict) else d):
+    if r.get("gpu") == g:
+        print(int(r["usage"]["gfx_activity"]["value"])); sys.exit(0)
+print(0)' "$gpu" <<<"$out" 2>/dev/null
+        return
+    fi
     out=$("$rocm_smi" -u 2>/dev/null) || return 1
     # Parse lines like:    "GPU[3]		: GPU use (%): 12"
     echo "$out" | awk -v g="$gpu" '
@@ -345,9 +363,9 @@ fi
 
 if [[ "$NO_WAIT" -eq 0 ]]; then
     ROCM_SMI=$(locate_rocm_smi) || {
-        err "rocm-smi not found on PATH or in /opt/rocm-*"
+        err "neither rocm-smi nor amd-smi found on PATH or in /opt/rocm-*"
         err "use --no-wait to skip the GPU-quiescence guard,"
-        err "or 'module load rocm' to put rocm-smi on PATH."
+        err "or 'module load rocm' to put rocm-smi/amd-smi on PATH."
         exit 3
     }
     if max_pct=$(wait_for_quiet "$ROCM_SMI" "$TIMEOUT" "$THRESHOLD" "$QUIET_DURATION"); then

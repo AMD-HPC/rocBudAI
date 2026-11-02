@@ -98,6 +98,10 @@ count_gpus() {
         n="$(rocm-smi --csv --showid 2>/dev/null | tail -n +2 | grep -c '^card' || true)"
         if [[ "${n:-0}" -gt 0 ]]; then echo "$n"; return 0; fi
     fi
+    if command -v amd-smi >/dev/null 2>&1; then
+        n="$(amd-smi list 2>/dev/null | grep -c '^GPU:' || true)"
+        if [[ "${n:-0}" -gt 0 ]]; then echo "$n"; return 0; fi
+    fi
     n=0
     local p sc
     for p in "${SYS_KFD}"/*/properties; do

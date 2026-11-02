@@ -145,31 +145,42 @@ fi
 echo
 
 # ---------------------------------------------------------------------------
-# 2. AMD GPUs (rocm-smi)
+# 2. AMD GPUs (rocm-smi; amd-smi on ROCm releases that no longer ship rocm-smi)
 # ---------------------------------------------------------------------------
 echo "2. AMD GPUs"
-if ! command -v rocm-smi >/dev/null 2>&1; then
-    warn "rocm-smi not on PATH"
+_smi=""
+if command -v rocm-smi >/dev/null 2>&1; then
+    _smi=rocm-smi; _smi_list=(rocm-smi --showid)
+elif command -v amd-smi >/dev/null 2>&1; then
+    _smi=amd-smi; _smi_list=(amd-smi list)
+fi
+if [[ -z "$_smi" ]]; then
+    warn "neither rocm-smi nor amd-smi on PATH"
     hint "the agent can still help with non-GPU profiling, but ROCm tools require it"
-elif ! rocm-smi --showid >/dev/null 2>&1; then
-    fail "rocm-smi present but cannot enumerate GPUs"
+elif ! "${_smi_list[@]}" >/dev/null 2>&1; then
+    fail "${_smi} present but cannot enumerate GPUs"
     hint "kernel/driver issue, or a node in CPX mode? rocBudAI requires SPX mode"
-    hint "check:  rocm-smi --showid    (raw output)"
+    hint "check:  ${_smi_list[*]}    (raw output)"
 else
-    # rocm-smi --csv --showid prints "card<N>,GPU ID" for each card; count.
+    # rocm-smi --csv --showid prints "card<N>,GPU ID" for each card;
+    # amd-smi list prints one "GPU: <N>" line per GPU; count.
     # In container quick-test mode the LLM + bench share whatever GPUs are
     # present, so a single GPU is fine; otherwise expect ROCBUDAI_MIN_GPUS.
     _min_gpus="${ROCBUDAI_MIN_GPUS:-4}"
     [[ -n "${ROCBUDAI_CONTAINER:-}" ]] && _min_gpus=1
-    ngpu="$(rocm-smi --csv --showid 2>/dev/null | tail -n +2 | grep -c '^card' || true)"
+    if [[ "$_smi" == rocm-smi ]]; then
+        ngpu="$(rocm-smi --csv --showid 2>/dev/null | tail -n +2 | grep -c '^card' || true)"
+    else
+        ngpu="$(amd-smi list 2>/dev/null | grep -c '^GPU:' || true)"
+    fi
     if [[ "${ngpu:-0}" -eq 0 ]]; then
-        fail "rocm-smi sees 0 GPUs"
+        fail "${_smi} sees 0 GPUs"
         hint "this node may be in a sliced GPU mode (e.g. MI300A CPX), incompatible with Ollama"
     elif [[ "${ngpu}" -lt "${_min_gpus}" ]]; then
-        warn "rocm-smi sees ${ngpu} GPUs (expected at least ${_min_gpus})"
+        warn "${_smi} sees ${ngpu} GPUs (expected at least ${_min_gpus})"
         hint "the default model needs N-1 GPUs to serve and 1 reserved for rocbudai-bench"
     else
-        ok "rocm-smi sees ${ngpu} GPUs"
+        ok "${_smi} sees ${ngpu} GPUs"
     fi
 fi
 echo

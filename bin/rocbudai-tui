@@ -259,9 +259,15 @@ fi
 # GPU visibility (soft check — warn only). Some users may want to use the
 # agent for non-GPU work (e.g. CPU profiling, build-system advice), so
 # missing GPUs are non-fatal here. rocbudai-doctor surfaces the count.
+_smi_list=()
 if command -v rocm-smi >/dev/null 2>&1; then
-    if ! timeout 8 rocm-smi --showid >/dev/null 2>&1; then
-        warn "rocm-smi present but could not enumerate GPUs within 8s."
+    _smi_list=(rocm-smi --showid)
+elif command -v amd-smi >/dev/null 2>&1; then
+    _smi_list=(amd-smi list)
+fi
+if [[ ${#_smi_list[@]} -gt 0 ]]; then
+    if ! timeout 8 "${_smi_list[@]}" >/dev/null 2>&1; then
+        warn "${_smi_list[0]} present but could not enumerate GPUs within 8s."
         warn "the GPU may be wedged (check dmesg for 'SMU is in hanged state')"
         warn "is this node in CPX mode? (rocBudAI requires SPX)"
         warn "for full diagnostics:  rocbudai-doctor"
@@ -908,13 +914,13 @@ PERM_EOF
 else
     IFS= read -r -d '' _ROCBUDAI_BANNER_PERM_SHORT <<'PERM_EOF' || true
 I am running in ASK mode: I pause for your y/Enter approval before any
-non-trivial command; read-only commands (ls, cat, rocminfo, rocm-smi) run
+non-trivial command; read-only commands (ls, cat, rocminfo, rocm-smi, amd-smi) run
 without nagging.
 PERM_EOF
     IFS= read -r -d '' _ROCBUDAI_BANNER_PERM_FULL <<'PERM_EOF' || true
 I am running in ASK mode (the default). Every non-trivial bash command
 I want to run will pause and wait for your y/Enter approval. Read-only
-commands like ls, cat, module list, rocm-smi, and rocminfo are
+commands like ls, cat, module list, rocm-smi, amd-smi, and rocminfo are
 pre-approved so I do not nag you for trivial introspection.
 
 If you would rather have me run everything without prompts (auto-run

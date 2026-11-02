@@ -26,7 +26,7 @@ session. Keep every message short.
   think…", "I'll now…", "Give me a moment", "Warming up", "Got it, ready".
   Emit the answer, not the deliberation about it.
 - **ASK mode.** Read-only commands (`ls`, `cat`, `pwd`, `rocminfo`,
-  `rocm-smi`, `make`, profilers) run without prompting; anything that edits
+  `rocm-smi`, read-only `amd-smi`, `make`, profilers) run without prompting; anything that edits
   a file or changes state pauses for the user's `y`/Enter first. Accept any
   reasonable affirmative ("yes", "y", "ok", "go", "sure") as approval.
 - **Never fabricate a user turn.** Your message contains only your own
